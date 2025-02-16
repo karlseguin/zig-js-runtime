@@ -16,10 +16,12 @@ const std = @import("std");
 
 const v8 = @import("v8"); // TODO: remove
 
-const internal = @import("../../internal_api.zig");
-const refl = internal.refl;
-const gen = internal.gen;
-const NativeContext = internal.NativeContext;
+const api = @import("../../api.zig");
+const refl = @import("../../reflect.zig");
+const NativeContext = @import("../../native_context.zig").NativeContext;
+
+const Env = api.Env;
+const Context = api.Context;
 
 const JSObjectID = @import("v8.zig").JSObjectID;
 const setNativeType = @import("generate.zig").setNativeType;
@@ -78,10 +80,11 @@ pub const FuncSync = struct {
     js_args: []v8.Value,
     isolate: v8.Isolate,
     thisArg: ?v8.Object = null,
+    native_context: *anyopaque,
 
     pub fn init(
-        alloc: std.mem.Allocator,
         comptime func: refl.Func,
+        native_context: anytype,
         raw_value: ?*const v8.C_Value,
         info: CallbackInfo,
         isolate: v8.Isolate,
@@ -100,7 +103,8 @@ pub const FuncSync = struct {
 
         // retrieve callback arguments
         // var js_args: [func.args_callback_nb]v8.Value = undefined;
-        var js_args = try alloc.alloc(v8.Value, func.args_callback_nb);
+        const allocator = native_context.allocator;
+        var js_args = try allocator.alloc(v8.Value, func.args_callback_nb);
         for (js_args_indexes, 0..) |index, i| {
             js_args[i] = info.getArg(raw_value, index, func.index_offset) orelse unreachable;
         }
@@ -115,26 +119,23 @@ pub const FuncSync = struct {
             func.index_offset,
         ) orelse unreachable;
 
-        std.debug.print("idx: {d}, offset: {d}, {any}\n", .{
-            func.callback_index.?,
-            idx,
-            js_func_val,
-        });
         if (!js_func_val.isFunction()) {
             return error.JSWrongType;
         }
         const js_func = js_func_val.castTo(v8.Function);
 
-        return FuncSync{
+        return .{
             .js_func = js_func,
             .js_args = js_args,
             .isolate = isolate,
+            .native_context = native_context,
         };
     }
 
-    pub fn setThisArg(self: *Func, nat_obj_ptr: anytype) !void {
+    pub fn setThisArg(self: *Func, comptime config: anytype, nat_obj_ptr: anytype) !void {
+        const native_context: *NativeContext(config) = @alignCast(@ptrCast(self.native_context));
         self.thisArg = try getV8Object(
-            self.nat_ctx,
+            native_context,
             nat_obj_ptr,
         ) orelse return error.V8ObjectNotFound;
     }
@@ -186,6 +187,8 @@ const PersistentValue = v8.Persistent(v8.Value);
 pub const Func = struct {
     _id: JSObjectID,
 
+    native_context: *anyopaque,
+
     // NOTE: we use persistent handles here
     // to ensure the references are not garbage collected
     // at the end of the JS calling function execution.
@@ -196,15 +199,13 @@ pub const Func = struct {
     // avoiding the need to allocate/free js_args_pers
     js_args_pers: []PersistentValue,
 
-    nat_ctx: *NativeContext,
     isolate: v8.Isolate,
 
     thisArg: ?v8.Object = null,
 
     pub fn init(
-        alloc: std.mem.Allocator,
-        nat_ctx: *NativeContext,
         comptime func: refl.Func,
+        native_context: anytype,
         raw_value: ?*const v8.C_Value,
         info: CallbackInfo,
         isolate: v8.Isolate,
@@ -227,7 +228,9 @@ pub const Func = struct {
         // NOTE: we need to store the JS callback arguments on the heap
         // as the call method will be executed in another stack frame,
         // once the asynchronous operation will be fetched back from the kernel.
-        var js_args_pers = try alloc.alloc(PersistentValue, func.args_callback_nb);
+
+        const allocator = native_context.allocator;
+        var js_args_pers = try allocator.alloc(PersistentValue, func.args_callback_nb);
 
         // retrieve callback arguments indexes
         if (comptime func.args_callback_nb > 0) {
@@ -252,18 +255,19 @@ pub const Func = struct {
             }
         }
 
-        return Func{
+        return .{
             ._id = JSObjectID.set(js_func_val.castTo(v8.Object)),
+            .native_context = native_context,
             .js_func_pers = js_func_pers,
             .js_args_pers = js_args_pers,
-            .nat_ctx = nat_ctx,
             .isolate = isolate,
         };
     }
 
-    pub fn setThisArg(self: *Func, nat_obj_ptr: anytype) !void {
+    pub fn setThisArg(self: *Func, comptime config: anytype, nat_obj_ptr: anytype) !void {
+        const native_context: *NativeContext(config) = @alignCast(@ptrCast(self.native_context));
         self.thisArg = try getV8Object(
-            self.nat_ctx,
+            native_context,
             nat_obj_ptr,
         ) orelse return error.V8ObjectNotFound;
     }
@@ -288,19 +292,19 @@ pub const Func = struct {
     }
 
     // call the function with a try catch to catch errors an report in res.
-    pub fn trycall(self: Func, nat_args: anytype, res: *Result) anyerror!void {
+    pub fn trycall(self: Func, comptime config: anytype, nat_args: anytype, res: *Result) anyerror!void {
         // JS try cache
         var try_catch: v8.TryCatch = undefined;
         try_catch.init(self.isolate);
         defer try_catch.deinit();
 
-        self.call(nat_args) catch |e| {
+        self.call(config, nat_args) catch |e| {
             res.success = false;
             if (try_catch.hasCaught()) {
                 // retrieve context
                 // NOTE: match the Func.call implementation
-                const ctx = self.isolate.getCurrentContext();
-                try res.setError(self.isolate, ctx, try_catch);
+                const context = self.isolate.getCurrentContext();
+                try res.setError(self.isolate, context, try_catch);
             }
 
             return e;
@@ -309,7 +313,7 @@ pub const Func = struct {
         res.success = true;
     }
 
-    pub fn call(self: Func, nat_args: anytype) anyerror!void {
+    pub fn call(self: Func, comptime config: anytype, nat_args: anytype) anyerror!void {
         // ensure Native args and JS args are not both provided
         const info = @typeInfo(@TypeOf(nat_args));
         if (comptime info != .Null) {
@@ -325,26 +329,30 @@ pub const Func = struct {
         // retrieve JS function from persistent handle
         const js_func = self.js_func_pers.castToFunction();
 
+        const native_context: *NativeContext(config) = @alignCast(@ptrCast(self.native_context));
+        const allocator = native_context.allocator;
+
         // retrieve arguments
-        var args = try self.nat_ctx.alloc.alloc(v8.Value, self.js_args_pers.len);
-        defer self.nat_ctx.alloc.free(args);
+        var args = try allocator.alloc(v8.Value, self.js_args_pers.len);
+        defer allocator.free(args);
+
         if (comptime info == .Struct) {
 
             // - Native arguments provided on function call
             std.debug.assert(info.Struct.is_tuple);
-            args = try self.nat_ctx.alloc.alloc(v8.Value, info.Struct.fields.len);
+            args = try allocator.alloc(v8.Value, info.Struct.fields.len);
             comptime var i = 0;
             inline while (i < info.Struct.fields.len) {
                 comptime var ret: refl.Type = undefined;
                 comptime {
                     ret = try refl.Type.reflect(info.Struct.fields[i].type, null);
-                    try ret.lookup(gen.Types);
+                    try ret.lookup(config.app_types, config.AppContext);
                 }
                 args[i] = try setNativeType(
-                    self.nat_ctx.alloc,
-                    self.nat_ctx,
                     ret,
-                    @field(nat_args, try refl.itoa(i)),
+                    config,
+                    native_context,
+                    @field(nat_args, std.fmt.comptimePrint("{d}", .{i})),
                     js_ctx,
                     self.isolate,
                 );

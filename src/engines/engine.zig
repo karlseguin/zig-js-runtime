@@ -12,8 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub const refs = @import("refs.zig");
-pub const refl = @import("reflect.zig");
-pub const gen = @import("generate.zig");
-pub const eng = @import("engine.zig");
-pub const NativeContext = @import("native_context.zig").NativeContext;
+const std = @import("std");
+
+const build_opts = @import("jsruntime_build_options");
+
+// retrieve JS engine
+pub const Engine = switch (build_opts.engine) {
+    .v8 => @import("v8/v8.zig"),
+};
+
+pub const EngineType = enum {
+    v8,
+};
+
+// pub const Object = Engine.Object;

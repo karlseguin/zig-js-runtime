@@ -72,9 +72,9 @@ pub const SingleThreaded = struct {
     // Stops when there is no more I/O events registered on the loop.
     // Note that I/O events callbacks might register more I/O events
     // on the go when they are executed (ie. nested I/O events).
-    pub fn run(self: *Self) !void {
+    pub fn run(self: *Self, comptime config: anytype) !void {
         while (self.eventsNb() > 0) {
-            try self.io.run_for_ns(10 * std.time.ns_per_ms);
+            try self.io.run_for_ns(config, 10 * std.time.ns_per_ms);
             // at each iteration we might have new events registred by previous callbacks
         }
         // TODO: return instead immediatly on the first JS callback error
@@ -119,16 +119,14 @@ pub const SingleThreaded = struct {
     };
 
     fn timeoutCallback(
-        ctx: *ContextTimeout,
+        comptime config: anytype,
+        ctx: anytype,
         completion: *IO.Completion,
         result: IO.TimeoutError!void,
     ) void {
         defer ctx.loop.freeCbk(completion, ctx);
 
-        const old_events_nb = ctx.loop.removeEvent();
-        if (builtin.is_test) {
-            report("timeout done, remaining events: {d}", .{old_events_nb - 1});
-        }
+        _ = ctx.loop.removeEvent();
 
         // TODO: return the error to the callback
         result catch |err| {
@@ -142,13 +140,13 @@ pub const SingleThreaded = struct {
         // js callback
         if (ctx.js_cbk) |js_cbk| {
             defer js_cbk.deinit(ctx.loop.alloc);
-            js_cbk.call(null) catch {
+            js_cbk.call(config, null) catch {
                 ctx.loop.cbk_error = true;
             };
         }
     }
 
-    pub fn timeout(self: *Self, nanoseconds: u63, js_cbk: ?JSCallback) usize {
+    pub fn timeout(self: *Self, comptime config: anytype, nanoseconds: u63, js_cbk: ?JSCallback) usize {
         const completion = self.alloc.create(IO.Completion) catch unreachable;
         completion.* = undefined;
         const ctx = self.alloc.create(ContextTimeout) catch unreachable;
@@ -156,12 +154,8 @@ pub const SingleThreaded = struct {
             .loop = self,
             .js_cbk = js_cbk,
         };
-        const old_events_nb = self.addEvent();
-        self.io.timeout(*ContextTimeout, ctx, timeoutCallback, completion, nanoseconds);
-        if (builtin.is_test) {
-            report("start timeout {d} for {d} nanoseconds", .{ old_events_nb + 1, nanoseconds });
-        }
-
+        _ = self.addEvent();
+        self.io.timeout(config, *ContextTimeout, ctx, timeoutCallback, completion, nanoseconds);
         return @intFromPtr(completion);
     }
 
@@ -171,6 +165,7 @@ pub const SingleThreaded = struct {
     };
 
     fn cancelCallback(
+        comptime config: anytype,
         ctx: *ContextCancel,
         completion: *IO.Completion,
         result: IO.CancelOneError!void,
@@ -194,13 +189,13 @@ pub const SingleThreaded = struct {
         // js callback
         if (ctx.js_cbk) |js_cbk| {
             defer js_cbk.deinit(ctx.loop.alloc);
-            js_cbk.call(null) catch {
+            js_cbk.call(config, null) catch {
                 ctx.loop.cbk_error = true;
             };
         }
     }
 
-    pub fn cancel(self: *Self, id: usize, js_cbk: ?JSCallback) void {
+    pub fn cancel(self: *Self, comptime config: anytype, id: usize, js_cbk: ?JSCallback) void {
         const comp_cancel: *IO.Completion = @ptrFromInt(id);
 
         const completion = self.alloc.create(IO.Completion) catch unreachable;
@@ -212,7 +207,7 @@ pub const SingleThreaded = struct {
         };
 
         const old_events_nb = self.addEvent();
-        self.io.cancel_one(*ContextCancel, ctx, cancelCallback, completion, comp_cancel);
+        self.io.cancel_one(config, *ContextCancel, ctx, cancelCallback, completion, comp_cancel);
         if (builtin.is_test) {
             report("cancel {d}", .{old_events_nb + 1});
         }

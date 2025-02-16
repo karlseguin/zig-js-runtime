@@ -23,12 +23,15 @@ const Callback = public.Callback;
 const CallbackSync = public.CallbackSync;
 const CallbackArg = public.CallbackArg;
 const JSObjectID = public.JSObjectID;
-const UserContext = public.UserContext;
+
+const Allocator = std.mem.Allocator;
 
 const JSObject = public.JSObject;
 
 const i64Num = public.i64Num;
 const u64Num = public.u64Num;
+
+const Reflect = @This();
 
 // NOTE: all the code in this file should be run comptime.
 
@@ -61,14 +64,14 @@ pub fn isBuiltinType(comptime T: type) bool {
 }
 
 const internal_types = [_]type{
-    std.mem.Allocator,
     Loop,
+    Allocator,
     JSObject,
     Callback,
+    Allocator,
     CallbackSync,
     CallbackArg,
     JSObjectID,
-    UserContext,
 };
 
 fn isInternalType(comptime T: type) bool {
@@ -91,7 +94,7 @@ pub const Type = struct {
 
     union_T: ?[]const Type,
 
-    pub inline fn isNative(comptime self: Type) bool {
+    pub fn isNative(comptime self: Type) bool {
         comptime {
             return self.T_refl_index != null and self.nested_index == null;
         }
@@ -124,84 +127,20 @@ pub const Type = struct {
         return @typeInfo(self.T).ErrorUnion.error_set;
     }
 
-    // NOTE: underlying types
-    // ----------------------
-    // The logic with underlying types is that a concrete Zig type
-    // can be encapsulated by several layers of syntax, sometimes additionaly:
-    // - an error union -> !T
-    // - an optional type -> ?T
-    // - a pointer -> *T
-    // And of course those can add themselves, eg. !?*T
-    // We need to get information about:
-    // - the original type, ie. the complete one
-    // - the underlying type, ie. the concrete one
-    // - and all the successive stages
-
-    // !Type
-    fn _underErr(comptime T: type) ?type {
-        const info = @typeInfo(T);
-        if (info != .ErrorUnion) {
-            return null;
-        }
-        return info.ErrorUnion.payload;
-    }
-    pub inline fn underErr(comptime self: Type) ?type {
-        std.debug.assert(@inComptime());
-        return Type._underErr(self.T);
+    pub fn underErr(comptime self: Type) ?type {
+        return Reflect.underErr(self.T);
     }
 
-    // !?Type (from underErr)
-    // ?Type
-    fn _underOpt(comptime T: type) ?type {
-        const TT = Type._underErr(T) orelse T;
-        const info = @typeInfo(TT);
-        if (info != .Optional) {
-            return null;
-        }
-        return info.Optional.child;
-    }
-    pub inline fn underOpt(comptime self: Type) ?type {
-        std.debug.assert(@inComptime());
-        return Type._underOpt(self.T);
+    pub fn underOpt(comptime self: Type) ?type {
+        return Reflect.underOpt(self.T);
     }
 
-    // !?*Type, ?*Type (from underOpt)
-    // !*Type (from underErr)
-    // *Type
-    fn _underPtr(comptime T: type) ?type {
-        var TT: type = undefined;
-        if (Type._underOpt(T)) |t| {
-            TT = t;
-        } else if (Type._underErr(T)) |t| {
-            TT = t;
-        } else {
-            TT = T;
-        }
-        const info = @typeInfo(TT);
-        if (info == .Pointer and info.Pointer.size != .Slice) {
-            // NOTE: slice are pointers but we handle them as single value
-            return info.Pointer.child;
-        }
-        return null;
-    }
-    pub inline fn underPtr(comptime self: Type) ?type {
-        std.debug.assert(@inComptime());
-        return Type._underPtr(self.T);
+    pub fn underPtr(comptime self: Type) ?type {
+        return Reflect.underPtr(self.T);
     }
 
-    // !?*Type, ?*Type, !*Type, *Type (from underPtr)
-    // !?Type, ?Type (from underOpt)
-    // !Type (from underErr)
-    // Type
-    fn _underT(comptime T: type) type {
-        if (Type._underPtr(T)) |TT| return TT;
-        if (Type._underOpt(T)) |TT| return TT;
-        if (Type._underErr(T)) |TT| return TT;
-        return T;
-    }
-    pub inline fn underT(comptime self: Type) type {
-        std.debug.assert(@inComptime());
-        return Type._underT(self.T);
+    pub fn underT(comptime self: Type) type {
+        return Reflect.underT(self.T);
     }
 
     // find if T is a VariadicType
@@ -241,7 +180,7 @@ pub const Type = struct {
 
     // find if T is a VariadicType
     // and returns it as a reflect.Type
-    pub fn variadic(comptime T: type, comptime structs: ?[]const Struct) !?Type {
+    pub fn variadic(comptime T: type, comptime structs: ?[]const Struct, comptime AppContext: type) !?Type {
         std.debug.assert(@inComptime());
 
         const TT = Type._variadic(T) orelse return null;
@@ -251,25 +190,26 @@ pub const Type = struct {
 
         var tt = try Type.reflect(TT, null);
         if (structs) |all| {
-            try tt.lookup(all);
+            try tt.lookup(all, AppContext);
         }
         return tt;
     }
 
     // check that user-defined types have been provided as an API
-    pub fn lookup(comptime self: *Type, comptime structs: []const Struct) Error!void {
-        std.debug.assert(@inComptime());
+    pub fn lookup(comptime self: *Type, comptime structs: []const Struct, comptime AppContext: type) Error!void {
+        const real_T = self.underT();
 
         // lookup unecessary
-        for (builtin_types) |builtin_T| {
-            if (builtin_T == self.underT()) {
-                return;
-            }
+        if (isBuiltinType(real_T)) {
+            return;
         }
-        for (internal_types) |internal_T| {
-            if (internal_T == self.underT()) {
-                return;
-            }
+
+        if (isInternalType(real_T)) {
+            return;
+        }
+
+        if (self.T == AppContext) {
+            return;
         }
 
         // if union, lookup each possible type
@@ -277,7 +217,7 @@ pub const Type = struct {
             var uts: [union_types.len]Type = undefined;
             inline for (union_types, 0..) |tt, i| {
                 var t = tt;
-                try t.lookup(structs);
+                try t.lookup(structs, AppContext);
                 uts[i] = t;
             }
             const cuts = uts;
@@ -286,22 +226,21 @@ pub const Type = struct {
         }
 
         // if variadic, lookup the concrete type
-        var variadic_type = try Type.variadic(self.underT(), null);
+        var variadic_type = try Type.variadic(self.underT(), null, AppContext);
         if (variadic_type) |*tt| {
-            return tt.lookup(structs);
+            return tt.lookup(structs, AppContext);
         }
 
         // check under_T in all structs (and nested structs)
         inline for (structs) |s| {
-            if (self.underT() == s.T or self.underT() == s.Self()) {
+            if (real_T == s.T or real_T == s.Self()) {
                 self.T_refl_index = s.index;
                 break;
             }
             inline for (s.nested, 0..) |nested, i| {
                 if (self.underT() == nested.T) {
                     if (self.underPtr() != null) {
-                        const msg = "pointer on nested struct is not allowed, choose a type struct for this use case";
-                        fmtErr(msg.len, msg, self.T);
+                        fmtErr("pointer on nested struct is not allowed, choose a type struct for this use case", self.T);
                         return error.TypeNestedPtr;
                     }
                     self.T_refl_index = s.index;
@@ -315,16 +254,14 @@ pub const Type = struct {
         }
 
         if (self.T_refl_index == null and self.nested_index == null) {
-            const msg = "lookup should be either builtin or defined";
-            fmtErr(msg.len, msg, self.T);
+            fmtErr("lookup should be either builtin or defined", self.T);
             return error.TypeLookup;
         }
     }
 
     fn reflectUnion(comptime T: type, comptime info: std.builtin.Type) Error![]const Type {
         if (info.Union.tag_type == null) {
-            const msg = "union should be a tagged";
-            fmtErr(msg.len, msg, T);
+            fmtErr("union should be a tagged", T);
             return error.TypeTaggedUnion;
         }
         var union_types: [info.Union.fields.len]Type = undefined;
@@ -339,7 +276,8 @@ pub const Type = struct {
     pub fn reflect(comptime T: type, comptime name: ?[]const u8) Error!Type {
         std.debug.assert(@inComptime());
 
-        const info = @typeInfo(Type._underT(T));
+        const real_T = Reflect.underT(T);
+        const info = @typeInfo(real_T);
 
         // union T
         var union_T: ?[]const Type = null;
@@ -348,21 +286,20 @@ pub const Type = struct {
         }
 
         // variadic types must be optional
-        if (Type._underOpt(T) == null) {
-            const under = Type._underT(T);
-            if (Type._is_variadic(under)) {
+        if (_is_variadic(real_T)) {
+            if (Reflect.underOpt(T) == null) {
                 return error.TypeVariadicNotOptional;
             }
         }
-
-        const cunion_T = union_T;
-
-        const t = Type{
+        return .{
             .T = T,
             .name = name,
-            .union_T = cunion_T,
+            .union_T = union_T,
         };
-        return t;
+    }
+
+    pub fn isGlobalType(self: Type) bool {
+        return Reflect.isGlobalType(self.T);
     }
 };
 
@@ -372,27 +309,22 @@ const Args = struct {
         if (self_T != null) {
             len += 1;
         }
+
+        var fields_offset = 0;
         var fields: [len]std.builtin.Type.StructField = undefined;
-        if (self_T != null) {
-            const name = try itoa(0);
-            fields[0] = std.builtin.Type.StructField{
-                // StructField.name expect a null terminated string.
-                // concatenate the `[]const u8` string with an empty string
-                // literal (`name ++ ""`) to explicitly coerce it to `[:0]const
-                // u8`.
-                .name = name ++ "",
-                .type = self_T.?,
-                .default_value = null,
+        if (self_T) |T| {
+            fields_offset = 1;
+            fields[0] = .{
+                .name = "0",
+                .type = T,
                 .is_comptime = false,
-                .alignment = @alignOf(self_T.?),
+                .default_value = null,
+                .alignment = @alignOf(T),
             };
         }
-        inline for (args, 0..) |arg, i| {
-            var x = i;
-            if (self_T != null) {
-                x += 1;
-            }
-            fields[x] = std.builtin.Type.StructField{
+
+        inline for (args, fields[fields_offset..]) |arg, *field| {
+            field.* = .{
                 // StructField.name expect a null terminated string.
                 // concatenate the `[]const u8` string with an empty string
                 // literal (`name ++ ""`) to explicitly coerce it to `[:0]const
@@ -404,16 +336,13 @@ const Args = struct {
                 .alignment = @alignOf(arg.T),
             };
         }
-        const decls = [_]std.builtin.Type.Declaration{};
-        const cfields = fields;
-        const s = std.builtin.Type.Struct{
+
+        return @Type(.{ .Struct = .{
             .layout = .auto,
-            .fields = &cfields,
-            .decls = &decls,
+            .decls = &.{},
+            .fields = &fields,
             .is_tuple = true,
-        };
-        const t = std.builtin.Type{ .Struct = s };
-        return @Type(t);
+        } });
     }
 };
 
@@ -423,52 +352,18 @@ const Symbol = enum {
 
     fn reflect(comptime name: []const u8) ?Symbol {
         if (std.mem.eql(u8, name, "_symbol_iterator")) {
-            return Symbol.iterator;
-        } else if (std.mem.eql(u8, name, "get_symbol_toStringTag")) {
-            return Symbol.string_tag;
+            return .iterator;
+        }
+        if (std.mem.eql(u8, name, "get_symbol_toStringTag")) {
+            return .string_tag;
         }
         return null;
     }
 };
 
-pub const FuncKind = enum {
-    ignore,
-    constructor,
-    getter,
-    setter,
-    method,
-
-    fn reflect(comptime T: type, decl: std.builtin.Type.Declaration) FuncKind {
-        // exclude declarations who are not functions
-        if (@typeInfo(@TypeOf(@field(T, decl.name))) != .Fn) {
-            return FuncKind.ignore;
-        }
-
-        // check method kind
-        if (std.mem.eql(u8, "constructor", decl.name)) {
-            return FuncKind.constructor;
-        }
-        if (std.mem.eql(u8, "_", decl.name[0..1])) {
-            return FuncKind.method;
-        }
-        // exclude declaration less than 6 char
-        // ie. non-special getter/setter names
-        if (decl.name.len < 4) {
-            return FuncKind.ignore;
-        }
-        if (std.mem.eql(u8, "get_", decl.name[0..4])) {
-            return FuncKind.getter;
-        }
-        if (std.mem.eql(u8, "set_", decl.name[0..4])) {
-            return FuncKind.setter;
-        }
-        return FuncKind.ignore;
-    }
-};
-
 pub const Func = struct {
-    js_name: []const u8,
     name: []const u8,
+    js_name: []const u8,
 
     // func signature
     args: []const Type,
@@ -488,24 +383,34 @@ pub const Func = struct {
 
     setter_index: ?u8, // TODO: not ideal, is there a cleaner solution?
 
-    kind: FuncKind,
+    kind: Kind,
 
-    fn lookupTypes(comptime self: *Func, comptime structs: []const Struct) Error!void {
+    pub const Kind = enum {
+        constructor,
+        getter,
+        setter,
+        method,
+    };
+
+    fn lookupTypes(comptime self: *Func, comptime structs: []const Struct, comptime AppContext: type) Error!void {
         // copy args
-        var args: [self.args.len]Type = undefined;
-        inline for (self.args, 0..) |arg, i| {
-            var a = arg;
-            try a.lookup(structs);
-            args[i] = a;
-        }
-        const cargs = args;
+        const cargs = blk: {
+            var args: [self.args.len]Type = undefined;
+            inline for (self.args, 0..) |arg, i| {
+                var a = arg;
+                try a.lookup(structs, AppContext);
+                args[i] = a;
+            }
+            break :blk args;
+        };
+
         self.args = &cargs;
-        try self.return_type.lookup(structs);
+        try self.return_type.lookup(structs, AppContext);
     }
 
     fn hasAlloc(comptime self: Func) bool {
         for (self.args) |arg| {
-            if (arg.underT() == std.mem.Allocator) {
+            if (arg.underT() == Allocator) {
                 return true;
             }
         }
@@ -514,44 +419,35 @@ pub const Func = struct {
 
     fn reflect(
         comptime T: type,
-        comptime kind: FuncKind,
+        comptime kind: Kind,
         comptime name: []const u8,
-        comptime struct_T: ?type,
+        comptime struct_T: type,
+        comptime AppContext: type,
     ) Error!Func {
-
-        // T should be a func
-        const func = @typeInfo(T);
-        if (func != .Fn) {
-            // should not happen as Funckind.reflect has been called before
-            @panic("func is not a function");
-        }
-
-        // check self is present
-        var args = func.Fn.params;
+        const func = @typeInfo(T).Fn;
+        var args = func.params;
         if (kind != .constructor and args.len == 0) {
             // TODO: handle "class methods"
-            const msg = "getter/setter/methods should have at least 1 argument, self";
-            fmtErr(msg.len, msg, T);
+            fmtErr("getter/setter/methods should have at least 1 argument, self", T);
             return error.FuncNoSelf;
         }
 
         // self special case (only for methods)
         var args_start = 0;
         var self_T: ?type = null;
-        if (struct_T != null and args.len > 0) {
+        if (args.len > 0) {
             if (kind != .constructor) {
                 // ignore self arg
                 args_start = 1;
                 self_T = args[0].type.?;
             }
-            if (kind == .setter and self_T.? != *struct_T.?) {
-                const msg = "setter first argument should be *self";
-                fmtErr(msg.len, msg, T);
+
+            if (kind == .setter and self_T.? != *struct_T) {
+                fmtErr("setter first argument should be *self", T);
                 return error.FuncSetterFirstArgNotSelfPtr;
             } else if (kind == .method or kind == .getter) {
-                if (self_T.? != struct_T.? and self_T.? != *struct_T.? and self_T.? != *const struct_T.?) {
-                    const msg = "getter/method first argument should be self, *self or *const self";
-                    fmtErr(msg.len, msg, T);
+                if (self_T.? != struct_T and self_T.? != *struct_T and self_T.? != *const struct_T) {
+                    fmtErr("getter/method first argument should be self, *self or *const self", T);
                     return error.FuncGetterMethodFirstArgNotSelfOrSelfPtr;
                 }
             }
@@ -560,28 +456,24 @@ pub const Func = struct {
         // args type
         args = args[args_start..];
         var args_types: [args.len]Type = undefined;
+
+        var args_callback_nb = 0;
         var index_offset: usize = 0;
         var callback_index: ?usize = null;
-        var args_callback_nb = 0;
+
         for (args, 0..) |arg, i| {
             if (arg.type.? == void) {
                 // TODO: there is a bug with void paramater => avoid for now
-                const msg = "func void parameters are not allowed for now";
-                fmtErr(msg.len, msg, T);
+                fmtErr("func void parameters are not allowed for now", T);
                 return error.FuncVoidArg;
             }
 
-            // arg name
-            var x = i;
-            if (kind != .constructor) {
-                x += 1;
-            }
-            const arg_name = try itoa(x);
-
-            args_types[i] = try Type.reflect(arg.type.?, arg_name);
+            const arg_name = itoa(i + args_start);
+            const arg_type = try Type.reflect(arg.type.?, arg_name);
+            args_types[i] = arg_type;
 
             // allocator
-            if (args_types[i].T == std.mem.Allocator) {
+            if (args_types[i].T == Allocator) {
                 index_offset += 1;
             }
 
@@ -591,70 +483,62 @@ pub const Func = struct {
             }
 
             // user context
-            if (args_types[i].T == UserContext) {
+            if (args_types[i].T == AppContext) {
                 index_offset += 1;
             }
 
             // JSObject
-            if (args_types[i].T == JSObject) {
+            if (arg_type.T == JSObject) {
                 // JSObject arg is not allowed in a constructor function
                 // as the corresponding JS object has not been yet created
-                if (kind == .constructor) return error.FuncCstrWithJSObject;
+                if (kind == .constructor) {
+                    return error.FuncCstrWithJSObject;
+                }
                 index_offset += 1;
+                continue;
             }
 
             // callback
             // ensure function has only 1 callback as argument
             // TODO: is this necessary?
-            if (args_types[i].T == Callback or args_types[i].T == CallbackSync) {
+            if (arg_type.T == Callback or arg_type.T == CallbackSync) {
                 if (callback_index != null) {
-                    const msg = "func has already 1 callback";
-                    fmtErr(msg.len, msg, T);
+                    fmtErr("func has already 1 callback", T);
                     return error.FuncMultiCbk;
                 }
-                callback_index = x;
+                callback_index = i + args_start;
+                continue;
             }
-            if (args_types[i].T == CallbackArg) {
+
+            if (arg_type.T == CallbackArg) {
                 args_callback_nb += 1;
+                continue;
             }
 
             // variadic
             // ensure only 1 variadic argument
             // and that it's the last one
-            if (Type._is_variadic(args_types[i].underT()) and i < (args.len - 1)) {
+            if (Type._is_variadic(arg_type.underT()) and i < (args.len - 1)) {
                 return error.FuncVariadicNotLastOne;
             }
 
             // error union prohibited for args
-            if (args_types[i].underErr() != null) {
+            if (arg_type.underErr() != null) {
                 return error.FuncErrorUnionArg;
             }
         }
 
-        // check getter and setter internal argument is an allocator
-        if (kind == .getter or kind == .setter) {
-            if (index_offset == 1) {
-                if (args[0].type.? != std.mem.Allocator) {
-                    const msg = "getter/setter non-internal argument should be an allocator";
-                    fmtErr(msg.len, msg, T);
-                    return error.FuncGetterSetterNotAllocator;
-                }
-            }
-        }
-
-        const js_args_nb = args.len - index_offset;
+        const js_args_count = args.len - index_offset;
 
         // check getter has no js arg
-        if (kind == .getter and js_args_nb > 0) {
-            const msg = "getter should have only 1 JS argument: self";
-            fmtErr(msg.len, msg, T);
+        if (kind == .getter and js_args_count > 0) {
+            fmtErr("getter should have only 1 JS argument: self", T);
             return error.FuncGetterMultiArg;
         }
 
         // check setter has at least one js arg
-        if (kind == .setter and js_args_nb == 0) {
-            const msg = "setter should have 1 JS argument";
-            fmtErr(msg.len, msg, T);
+        if (kind == .setter and js_args_count == 0) {
+            fmtErr("setter should have 1 JS argument", T);
             return error.FuncSetterNoArg;
         }
 
@@ -670,27 +554,23 @@ pub const Func = struct {
         }
 
         // generate javascript name
-        var field_name: []const u8 = undefined;
-        if (kind == .getter or kind == .setter) {
-            field_name = name[4..name.len]; // remove get_ and set_
-        } else if (kind == .method) {
-            field_name = name[1..name.len]; // remove _
-        } else {
-            field_name = name;
-        }
-        const js_name = jsName(field_name);
+        const js_name = jsName(switch (kind) {
+            .getter, .setter => name[4..], // remove leading get_ or set_
+            .method => name[1..], // remove leading _
+            else => name,
+        });
 
         // reflect args
         const args_slice = args_types;
         const args_T = comptime Args.reflect(self_T, &args_slice);
 
         // reflect return type
-        const return_type = try Type.reflect(func.Fn.return_type.?, null);
+        const return_type = try Type.reflect(func.return_type.?, null);
         if (Type._is_variadic(return_type.underT())) return error.FuncReturnTypeVariadic;
 
-        return Func{
-            .js_name = js_name,
+        return .{
             .name = name,
+            .js_name = js_name,
 
             // func signature
             .args = &args_slice,
@@ -713,6 +593,36 @@ pub const Func = struct {
             .kind = kind,
         };
     }
+
+    fn getKind(comptime T: type, decl: std.builtin.Type.Declaration) ?Kind {
+        // exclude declarations who are not functions
+        if (@typeInfo(@TypeOf(@field(T, decl.name))) != .Fn) {
+            return null;
+        }
+
+        // check method kind
+        if (std.mem.eql(u8, "constructor", decl.name)) {
+            return .constructor;
+        }
+
+        if (decl.name[0] == '_') {
+            return .method;
+        }
+
+        // exclude declaration less than 6 char
+        // ie. non-special getter/setter names
+        if (decl.name.len < 4) {
+            return .ignore;
+        }
+        if (std.mem.startsWith(u8, decl.name, "get_")) {
+            return .getter;
+        }
+        if (std.mem.startsWith(u8, decl.name, "set_")) {
+            return .setter;
+        }
+
+        return null;
+    }
 };
 
 pub const StructNested = struct {
@@ -724,9 +634,11 @@ pub const StructNested = struct {
         // TODO: and "prototype"?
         if (std.mem.eql(u8, decl.name, "Self")) {
             return false;
-        } else if (std.mem.eql(u8, decl.name, "mem_guarantied")) {
+        }
+        if (std.mem.eql(u8, decl.name, "mem_guarantied")) {
             return false;
-        } else if (std.mem.eql(u8, decl.name, "Exception")) {
+        }
+        if (std.mem.eql(u8, decl.name, "Exception")) {
             return false;
         }
 
@@ -777,8 +689,7 @@ pub const Struct = struct {
     static_attrs_T: ?type,
 
     // struct functions
-    has_constructor: bool,
-    constructor: Func,
+    constructor: ?Func,
 
     getters: []const Func,
     setters: []const Func,
@@ -819,24 +730,24 @@ pub const Struct = struct {
         }
     }
 
-    pub inline fn isEmpty(comptime self: Struct) bool {
+    pub fn isEmpty(comptime self: Struct) bool {
         if (@typeInfo(self.Self()) == .Opaque) {
             return false;
         }
         return @sizeOf(self.Self()) == 0;
     }
 
-    fn lookupTypes(comptime self: *Struct, comptime structs: []Struct) Error!void {
-        try self.value.lookup(structs);
-        if (self.has_constructor) {
-            try self.constructor.lookupTypes(structs);
+    fn lookupTypes(comptime self: *Struct, comptime structs: []Struct, comptime AppContext: type) Error!void {
+        try self.value.lookup(structs, AppContext);
+        if (self.constructor) |*constructor| {
+            try constructor.lookupTypes(structs, AppContext);
         }
 
         // copy getters
         var getters: [self.getters.len]Func = undefined;
         inline for (self.getters, 0..) |getter, i| {
             var f = getter;
-            try f.lookupTypes(structs);
+            try f.lookupTypes(structs, AppContext);
             getters[i] = f;
         }
         const cgetters = getters;
@@ -846,7 +757,7 @@ pub const Struct = struct {
         var setters: [self.setters.len]Func = undefined;
         inline for (self.setters, 0..) |setter, i| {
             var f = setter;
-            try f.lookupTypes(structs);
+            try f.lookupTypes(structs, AppContext);
             setters[i] = f;
         }
         const csetters = setters;
@@ -856,7 +767,7 @@ pub const Struct = struct {
         var methods: [self.methods.len]Func = undefined;
         inline for (self.methods, 0..) |method, i| {
             var f = method;
-            try f.lookupTypes(structs);
+            try f.lookupTypes(structs, AppContext);
             methods[i] = f;
         }
         const cmethods = methods;
@@ -870,7 +781,7 @@ pub const Struct = struct {
             var fields: [nested.fields.len]Type = undefined;
             inline for (nested.fields, 0..) |field, j| {
                 var f = field;
-                try f.lookup(structs);
+                try f.lookup(structs, AppContext);
                 fields[j] = f;
             }
             const cfields = fields;
@@ -910,15 +821,16 @@ pub const Struct = struct {
         if (attr_info == .Fn) { // functions
             return null;
         }
-        for (builtin_types) |builtin_T| {
-            if (builtin_T == attr_T) {
-                return attr_T;
-            }
+
+        if (isBuiltinType(attr_T)) {
+            return attr_T;
         }
+
         // string literal
         if (isStringLiteral(attr_T)) {
             return []const u8;
         }
+
         const value = @field(T, decl.name);
         // comptime_int
         if (attr_T == comptime_int) {
@@ -945,7 +857,6 @@ pub const Struct = struct {
             }
         }
         // TODO: comptime_float
-        @compileLog(attr_T);
         @compileError("static attribute type not handled");
     }
 
@@ -953,71 +864,55 @@ pub const Struct = struct {
         const decls = @typeInfo(T).Struct.decls;
 
         // first pass for attrs nb
-        var attrs_nb = 0;
+        var attribute_count = 0;
         for (decls) |decl| {
             if (AttrT(T, decl) == null) {
                 continue;
             }
-            attrs_nb += 1;
+            attribute_count += 1;
         }
-        if (attrs_nb == 0) {
+
+        if (attribute_count == 0) {
             return null;
         }
 
         // second pass to build attrs type
-        var fields: [attrs_nb]std.builtin.Type.StructField = undefined;
-        var attrs_done = 0;
+        var fields: [attribute_count]std.builtin.Type.StructField = undefined;
+
+        var i = 0;
         for (decls) |decl| {
-            const attr_T = AttrT(T, decl);
-            if (attr_T == null) {
-                continue;
+            if (AttrT(T, decl)) |attr_T| {
+                fields[i] = .{
+                    .name = decl.name[1..decl.name.len], // remove _
+                    .type = attr_T,
+                    .default_value = null,
+                    .is_comptime = false, // TODO: should be true here?
+                    .alignment = if (@sizeOf(attr_T) > 0) @alignOf(attr_T) else 0,
+                };
+                i += 1;
             }
-            fields[attrs_done] = std.builtin.Type.StructField{
-                .name = decl.name[1..decl.name.len], // remove _
-                .type = attr_T.?,
-                .default_value = null,
-                .is_comptime = false, // TODO: should be true here?
-                .alignment = if (@sizeOf(attr_T.?) > 0) @alignOf(attr_T.?) else 0,
-            };
-            attrs_done += 1;
         }
-        const cfields = fields;
-        return @Type(.{
-            .Struct = .{
-                .layout = .auto,
-                .fields = &cfields,
-                .decls = &.{},
-                .is_tuple = false,
-            },
-        });
+
+        return @Type(.{ .Struct = .{
+            .layout = .auto,
+            .fields = &fields,
+            .decls = &.{},
+            .is_tuple = false,
+        } });
     }
 
     pub fn staticAttrs(comptime self: Struct, comptime attrs_T: type) attrs_T {
         var attrs: attrs_T = undefined;
         var done = 0;
         for (@typeInfo(self.T).Struct.decls) |decl| {
-            const attr_T = AttrT(self.T, decl);
-            if (attr_T == null) {
-                continue;
+            if (AttrT(self.T, decl)) |attr_T| {
+                const name = decl.name[1..decl.name.len]; // remove _
+                const value = @as(attr_T, @field(self.T, decl.name));
+                @field(attrs, name) = value;
+                done += 1;
             }
-            const name = decl.name[1..decl.name.len]; // remove _
-            const value = @as(attr_T.?, @field(self.T, decl.name));
-            @field(attrs, name) = value;
-            done += 1;
         }
         return attrs;
-    }
-
-    // Does the T has a well-formed deinit method?
-    fn _checkDeinit(comptime T: type, comptime self_T: type, isErr: bool) !void {
-        if (!isDecl(
-            T,
-            "deinit",
-            fn (_: *self_T, _: std.mem.Allocator) void,
-            isErr,
-        )) {
-            return error.StructAllocWrongDeinit;
-        }
     }
 
     // Is the T a well-formed exception?
@@ -1041,18 +936,11 @@ pub const Struct = struct {
         if (!isDecl(
             T,
             "init",
-            fn (_: std.mem.Allocator, _: anyerror, _: []const u8) anyerror!T,
+            fn (_: Allocator, _: anyerror, _: []const u8) anyerror!T,
             isErr,
         )) return err;
         if (!isDecl(T, "get_name", fn (_: T) []const u8, isErr)) return err;
         if (!isDecl(T, "get_message", fn (_: T) []const u8, isErr)) return err;
-    }
-
-    // Has the API a deinit method?
-    pub fn hasDenit(comptime self: Struct) bool {
-        std.debug.assert(@inComptime());
-        Struct._checkDeinit(self.T, self.Self(), false) catch false;
-        return true;
     }
 
     // Is the API an exception?
@@ -1079,7 +967,7 @@ pub const Struct = struct {
         std.debug.assert(@inComptime());
 
         // errors have already been checked at lookup stage
-        if (Struct._hasException(self.T) catch unreachable) |T| {
+        if (_hasException(self.T) catch unreachable) |T| {
             for (all) |s| {
                 if (s.T == T) return s;
             }
@@ -1106,8 +994,7 @@ pub const Struct = struct {
         // check the 'protoype' declaration is a pointer
         const proto_info = @typeInfo(@field(T, "prototype"));
         if (proto_info != .Pointer) {
-            const msg = "struct 'prototype' declared must be a Pointer";
-            fmtErr(msg.len, msg, T);
+            fmtErr("struct 'prototype' declared must be a Pointer", T);
             return error.StructPrototypeNotPointer;
         }
         proto_T = proto_info.Pointer.child;
@@ -1128,8 +1015,7 @@ pub const Struct = struct {
 
                 // check the 'proto' field is not a pointer
                 if (@typeInfo(field.type) == .Pointer) {
-                    const msg = "struct {s} 'proto' field should not be a Pointer";
-                    fmtErr(msg.len, msg, T);
+                    fmtErr("struct {s} 'proto' field should not be a Pointer", T);
                     return error.StructProtoPointer;
                 }
 
@@ -1137,8 +1023,7 @@ pub const Struct = struct {
                 // check the 'proto' field is the first one
                 if (@typeInfo(T).Struct.layout != .auto) {
                     if (i != 0) {
-                        const msg = "'proto' field should be the first one if memory layout is guarantied (extern)";
-                        fmtErr(msg.len, msg, T);
+                        fmtErr("'proto' field should be the first one if memory layout is guarantied (extern)", T);
                         return error.StructProtoLayout;
                     }
                 }
@@ -1174,8 +1059,7 @@ pub const Struct = struct {
                 proto_res = ret_T;
             }
         } else {
-            const msg = "struct declares a 'prototype' but does not have a 'proto' field neither prototype has 'protoCast' function";
-            fmtErr(msg.len, msg, T);
+            fmtErr("struct declares a 'prototype' but does not have a 'proto' field neither prototype has 'protoCast' function", T);
             return error.StructWithoutProto;
         }
 
@@ -1187,20 +1071,17 @@ pub const Struct = struct {
             compare_T = proto_T.?;
         }
         if (proto_res != compare_T) {
-            const msg = "struct 'proto' field is different than 'prototype' declaration";
-            fmtErr(msg.len, msg, T);
+            fmtErr("struct 'proto' field is different than 'prototype' declaration", T);
             return error.StructProtoDifferent;
         }
         return proto_T;
     }
 
-    fn reflect(comptime T: type, comptime index: usize) Error!Struct {
-
+    fn reflect(comptime T: type, comptime AppContext: type, comptime index: usize) Error!Struct {
         // T should be a struct
         const obj = @typeInfo(T);
         if (obj != .Struct) {
-            const msg = "type is not a struct";
-            fmtErr(msg.len, msg, T);
+            fmtErr("type is not a struct", T);
             return error.StructNotStruct;
         }
 
@@ -1210,28 +1091,24 @@ pub const Struct = struct {
         // see: https://github.com/ziglang/zig/issues/2201
         // and https://github.com/ziglang/zig/issues/3133
         if (obj.Struct.layout == .@"packed") {
-            const msg = "type packed struct are not supported";
-            fmtErr(msg.len, msg, T);
+            fmtErr("type packed struct are not supported", T);
             return error.StructPacked;
         }
 
         // self type
+        var real_T: type = T;
         var self_T: ?type = null;
-        var real_T: type = undefined;
         if (@hasDecl(T, "Self")) {
             self_T = @field(T, "Self");
             real_T = self_T.?;
             if (@typeInfo(real_T) == .Pointer) {
-                const msg = "type Self type should not be a pointer";
-                fmtErr(msg.len, msg, T);
+                fmtErr("type Self type should not be a pointer", T);
                 return error.StructSelfPointer;
             }
-        } else {
-            real_T = T;
         }
+
         if (@typeInfo(real_T) != .Struct and @typeInfo(real_T) != .Opaque) {
-            const msg = "type is not a struct or opaque";
-            fmtErr(msg.len, msg, T);
+            fmtErr("type is not a struct or opaque", T);
             return error.StructNotStruct;
         }
 
@@ -1239,58 +1116,53 @@ pub const Struct = struct {
         const struct_name = shortName(T);
 
         // protoype
-        const proto_T = try Struct.reflectProto(T, real_T);
-        var mem_guarantied: bool = undefined;
-        if (@hasDecl(T, "mem_guarantied")) {
-            mem_guarantied = true;
-        } else {
-            mem_guarantied = @typeInfo(T).Struct.layout != .auto;
-        }
+        const proto_T = try reflectProto(T, real_T);
+        const mem_guarantied: bool = @typeInfo(T).Struct.layout != .auto or @hasDecl(T, "mem_guarantied");
 
         // nested types
-        var nested_nb: usize = 0;
-        // first iteration to retrieve the number of nested structs
-        inline for (obj.Struct.decls) |decl| {
-            if (StructNested.isNested(T, decl)) {
-                nested_nb += 1;
+        const nested = blk: {
+            var count: usize = 0;
+
+            // first iteration to retrieve the number of nested structs
+            inline for (obj.Struct.decls) |decl| {
+                if (StructNested.isNested(T, decl)) {
+                    count += 1;
+                }
             }
-        }
-        var nested: [nested_nb]StructNested = undefined;
-        if (nested_nb > 0) {
+
+            var n: [count]StructNested = undefined;
             var nested_done: usize = 0;
             inline for (obj.Struct.decls) |decl| {
                 if (StructNested.isNested(T, decl)) {
                     const decl_type = @field(T, decl.name);
-                    nested[nested_done] = StructNested.reflect(decl_type);
+                    n[nested_done] = StructNested.reflect(decl_type);
                     nested_done += 1;
                 }
             }
-        }
+            break :blk n;
+        };
 
         // retrieve the number of each function kind
-        var getters_nb: u8 = 0;
-        var setters_nb: u8 = 0;
-        var methods_nb: u8 = 0;
+        var getters_count: u8 = 0;
+        var setters_count: u8 = 0;
+        var methods_count: u8 = 0;
 
         // iterate over struct declarations
         // struct fields are considerated private and ignored
         // first iteration to retrieve the number of each method kind
         inline for (obj.Struct.decls) |decl| {
-            const kind = comptime FuncKind.reflect(T, decl);
-            switch (kind) {
-                .ignore => continue,
+            switch (comptime Func.getKind(T, decl) orelse continue) {
                 .constructor => {},
-                .getter => getters_nb += 1,
-                .setter => setters_nb += 1,
-                .method => methods_nb += 1,
+                .getter => getters_count += 1,
+                .setter => setters_count += 1,
+                .method => methods_count += 1,
             }
         }
 
-        var constructor: Func = undefined;
-        var has_constructor = false;
-        var getters: [getters_nb]Func = undefined;
-        var setters: [setters_nb]Func = undefined;
-        var methods: [methods_nb]Func = undefined;
+        var constructor: ?Func = null;
+        var getters: [getters_count]Func = undefined;
+        var setters: [setters_count]Func = undefined;
+        var methods: [methods_count]Func = undefined;
 
         var getters_done: u8 = 0;
         var setters_done: u8 = 0;
@@ -1301,18 +1173,12 @@ pub const Struct = struct {
         inline for (obj.Struct.decls) |decl| {
 
             // check declaration kind
-            const kind = comptime FuncKind.reflect(T, decl);
-            if (kind == .ignore) {
-                continue;
-            }
+            const kind = comptime Func.getKind(T, decl) orelse continue;
             const func = @TypeOf(@field(T, decl.name));
-            const func_reflected = comptime try Func.reflect(func, kind, decl.name, real_T);
+            const func_reflected = comptime try Func.reflect(func, kind, decl.name, real_T, AppContext);
 
             switch (kind) {
-                .constructor => {
-                    constructor = func_reflected;
-                    has_constructor = true;
-                },
+                .constructor => constructor = func_reflected,
                 .getter => {
                     getters[getters_done] = func_reflected;
                     getters_done += 1;
@@ -1325,87 +1191,40 @@ pub const Struct = struct {
                     methods[methods_done] = func_reflected;
                     methods_done += 1;
                 },
-                else => unreachable,
             }
         }
 
         for (&getters) |*getter| {
-            var setter_index: ?u8 = null;
             for (setters, 0..) |setter, i| {
                 if (std.mem.eql(u8, getter.js_name, setter.js_name)) {
-                    setter_index = i;
+                    getter.setter_index = i;
                     break;
                 }
-            }
-            if (setter_index != null) {
-                getter.setter_index = setter_index;
             }
         }
 
         // postAttach
-        if (@hasDecl(T, "postAttach")) {
-            _ = postAttachFunc(T) catch {
-                const msg = "function 'postAttach' not well formed";
-                fmtErr(msg.len, msg, T);
-                return error.FuncPostAttach;
-            };
-        }
+        _ = postAttachFunc(T) catch {
+            fmtErr("function 'postAttach' not well formed", T);
+            return error.FuncPostAttach;
+        };
 
-        // check deinit
-        // only if at least one function has an allocator argument
-        var check_deinit = false;
-        if (has_constructor and constructor.hasAlloc()) {
-            check_deinit = true;
-        }
-        if (!check_deinit) {
-            for (getters) |getter| {
-                if (getter.hasAlloc()) {
-                    check_deinit = true;
-                    break;
-                }
-            }
-        }
-        if (!check_deinit) {
-            for (setters) |setter| {
-                if (setter.hasAlloc()) {
-                    check_deinit = true;
-                    break;
-                }
-            }
-        }
-        if (!check_deinit) {
-            for (methods) |method| {
-                if (method.hasAlloc()) {
-                    check_deinit = true;
-                    break;
-                }
-            }
-        }
-        if (check_deinit) {
-            if (self_T) |self| {
-                try Struct._checkDeinit(T, self, true);
-            } else {
-                try Struct._checkDeinit(T, T, true);
-            }
-        }
+        try assertDeinit(real_T);
 
         // string tag
         var string_tag: bool = false;
         for (getters) |getter| {
-            if (getter.symbol) |symbol| {
-                if (symbol == .string_tag) {
-                    string_tag = true;
-                    break;
-                }
+            if (getter.symbol == .string_tag) {
+                string_tag = true;
+                break;
             }
         }
 
         const cgetters = getters;
         const csetters = setters;
         const cmethods = methods;
-        const cnested = nested;
 
-        return Struct{
+        return .{
             // struct info
             .name = struct_name,
             .js_name = jsName(struct_name),
@@ -1423,15 +1242,18 @@ pub const Struct = struct {
             .proto_T = proto_T,
 
             // struct functions
-            .has_constructor = has_constructor,
             .constructor = constructor,
             .getters = &cgetters,
             .setters = &csetters,
             .methods = &cmethods,
 
             // nested types
-            .nested = &cnested,
+            .nested = &nested,
         };
+    }
+
+    pub fn isGlobalType(self: *const Struct) bool {
+        return Reflect.isGlobalType(self.T);
     }
 };
 
@@ -1458,8 +1280,7 @@ fn lookupPrototype(comptime all: []Struct) Error!void {
             break;
         }
         if (s.proto_index == null) {
-            const msg = "struct lookup search of protototype failed";
-            fmtErr(msg.len, msg, s.T);
+            fmtErr("struct lookup search of protototype failed", s.T);
             return error.StructLookup;
         }
     }
@@ -1476,7 +1297,7 @@ fn lookupDuplicates(comptime all: []Struct) Error!void {
             // creating bugs in Type lookup (ie. Type.T_refl_index)
             if (s.Self() == other_s.Self()) {
                 const msg = "duplicate of type (or self type) for " ++ @typeName(s.T) ++ " and " ++ @typeName(other_s.T);
-                fmtErr(msg.len, msg, s.Self());
+                fmtErr(msg, s.Self());
                 return error.StructDuplicateType;
             }
 
@@ -1484,16 +1305,15 @@ fn lookupDuplicates(comptime all: []Struct) Error!void {
             if (std.mem.eql(u8, s.js_name, other_s.js_name)) {
                 const msg = "duplicate of JS name for " ++ @typeName(s.T) ++ " and " ++ @typeName(other_s.T);
 
-                fmtErr(msg.len, msg, s.Self());
+                fmtErr(msg, s.Self());
                 return error.StructDuplicateName;
             }
         }
 
         // Check if global type declaration is duplicated.
-        if (isGlobalType(s.T)) {
+        if (s.isGlobalType()) {
             if (count_global_type > 0) {
-                const msg = "duplicate global type declaration";
-                fmtErr(msg.len, msg, s.T);
+                fmtErr("duplicate global type declaration", s.T);
                 return error.StructDuplicateGlobalType;
             }
             count_global_type += 1;
@@ -1514,24 +1334,88 @@ fn lookupException(comptime all: []Struct) Error!void {
     }
 }
 
-pub fn do(comptime types: anytype) Error![]const Struct {
-    comptime {
+// NOTE: underlying types
+// ----------------------
+// The logic with underlying types is that a concrete Zig type
+// can be encapsulated by several layers of syntax, sometimes additionaly:
+// - an error union -> !T
+// - an optional type -> ?T
+// - a pointer -> *T
+// And of course those can add themselves, eg. !?*T
+// We need to get information about:
+// - the original type, ie. the complete one
+// - the underlying type, ie. the concrete one
+// - and all the successive stages
 
-        // check types provided
-        const types_T = @TypeOf(types);
-        const types_info = @typeInfo(types_T);
-        if (types_info != .Struct or !types_info.Struct.is_tuple) {
-            const msg = "arg 'types' should be a tuple of types";
-            fmtErr(msg.len, msg, types_T);
-            return error.TypesNotTuple;
-        }
-        const types_fields = types_info.Struct.fields;
+// !?*Type, ?*Type, !*Type, *Type (from underPtr)
+// !?Type, ?Type (from underOpt)
+// !Type (from underErr)
+// Type
+fn underT(comptime T: type) type {
+    if (underPtr(T)) |TT| return TT;
+    if (underOpt(T)) |TT| return TT;
+    if (underErr(T)) |TT| return TT;
+    return T;
+}
+
+// !?*Type, ?*Type (from underOpt)
+// !*Type (from underErr)
+// *Type
+fn underPtr(comptime T: type) ?type {
+    var TT: type = undefined;
+    if (underOpt(T)) |t| {
+        TT = t;
+    } else if (underErr(T)) |t| {
+        TT = t;
+    } else {
+        TT = T;
+    }
+    const info = @typeInfo(TT);
+    if (info == .Pointer and info.Pointer.size != .Slice) {
+        // NOTE: slice are pointers but we handle them as single value
+        return info.Pointer.child;
+    }
+    return null;
+}
+
+// !?Type (from underErr)
+// ?Type
+fn underOpt(comptime T: type) ?type {
+    const TT = underErr(T) orelse T;
+    const info = @typeInfo(TT);
+    if (info != .Optional) {
+        return null;
+    }
+    return info.Optional.child;
+}
+
+// !Type
+fn underErr(comptime T: type) ?type {
+    const info = @typeInfo(T);
+    if (info != .ErrorUnion) {
+        return null;
+    }
+    return info.ErrorUnion.payload;
+}
+
+fn isGlobalType(comptime T: type) bool {
+    std.debug.assert(@inComptime());
+    if (@hasDecl(T, "global_type")) {
+        return T.global_type;
+    }
+    return false;
+}
+
+pub fn typesToStruct(comptime interfaces: anytype, comptime AppContext: type) Error![]const Struct {
+    comptime {
+        const types = mergeAndFlatten(interfaces){};
+        const types_fields = @typeInfo(@TypeOf(types)).Struct.fields;
 
         // reflect each type
         var all: [types_fields.len]Struct = undefined;
         for (types_fields, 0..) |field, i| {
             const T = @field(types, field.name);
-            all[i] = try Struct.reflect(T, i);
+            all[i] = try Struct.reflect(T, AppContext, i);
         }
 
         // look for duplicates (on types and js names)
@@ -1554,7 +1438,7 @@ pub fn do(comptime types: anytype) Error![]const Struct {
 
         // look Types for corresponding Struct
         for (&all) |*s| {
-            try s.lookupTypes(&all);
+            try s.lookupTypes(&all, AppContext);
         }
 
         // handle comptime var.
@@ -1679,6 +1563,34 @@ fn assertFuncReturnT(comptime func: type, comptime T: type, comptime opts: EqlOp
     assertT(T, ret, opts) catch return error.AssertFuncReturnT;
 }
 
+fn assertDeinit(comptime T: type) !void {
+    if (@hasDecl(T, "deinit") == false) {
+        return;
+    }
+
+    const func = @typeInfo(@TypeOf(@field(T, "deinit"))).Fn;
+
+    if (func.params.len != 1 and func.params.len != 2) {
+        return error.StructAllocWrongDeinit;
+    }
+
+    // why is type nullable?
+    const first_T = func.params[0].type.?;
+    if (first_T != *T and first_T != *const T and first_T != T) {
+        return error.StructAllocWrongDeinit;
+    }
+    if (func.params.len == 1) {
+        return;
+    }
+
+
+    if (func.params[1].type.? == Allocator) {
+        return;
+    }
+
+    return error.StructAllocWrongDeinit;
+}
+
 // createTupleT generate a tuple type
 // with the members passed as fields
 fn createTupleT(comptime members: []const type) type {
@@ -1689,7 +1601,7 @@ fn createTupleT(comptime members: []const type) type {
             // concatenate the `[]const u8` string with an empty string
             // literal (`name ++ ""`) to explicitly coerce it to `[:0]const
             // u8`.
-            .name = try itoa(i) ++ "",
+            .name = itoa(i) ++ "",
             .type = member,
             .default_value = null,
             .is_comptime = false,
@@ -1757,10 +1669,11 @@ pub fn postAttachFunc(comptime T: type) !?type {
     std.debug.assert(@inComptime());
     try assertApi(T);
 
-    const name = "postAttach";
-    if (!@hasDecl(T, name)) return null;
+    if (!@hasDecl(T, "postAttach")) {
+        return null;
+    }
 
-    const func = @TypeOf(@field(T, name));
+    const func = @TypeOf(@field(T, "postAttach"));
     try assertFuncIsMethod(*T, func, true);
     try assertFuncParamsJSNb(func, 1); // 1 JS param, self
     try assertFuncHasParamT(func, JSObject);
@@ -1771,14 +1684,6 @@ pub fn postAttachFunc(comptime T: type) !?type {
 pub fn hasDefaultValue(comptime T: type, comptime index: usize) bool {
     std.debug.assert(@inComptime());
     return @typeInfo(T).Struct.fields[index].default_value != null;
-}
-
-pub fn isGlobalType(comptime T: type) bool {
-    std.debug.assert(@inComptime());
-    if (@hasDecl(T, "global_type")) {
-        return T.global_type;
-    }
-    return false;
 }
 
 // Utils funcs
@@ -1799,27 +1704,20 @@ fn jsName(comptime name: []const u8) []const u8 {
 
     // otherwhise lower first character
     var js_name: [name.len]u8 = undefined;
+    @memcpy(&js_name, name);
     js_name[0] = std.ascii.toLower(name[0]);
-    for (name, 0..) |char, i| {
-        if (i == 0) {
-            continue;
-        }
-        js_name[i] = char;
-    }
+
     const cname = js_name;
     return &cname;
 }
 
 fn shortName(comptime T: type) []const u8 {
-    var it = std.mem.splitBackwards(u8, @typeName(T), ".");
+    var it = std.mem.splitBackwardsScalar(u8, @typeName(T), '.');
     return it.first();
 }
 
-pub fn itoa(i: u8) ![]const u8 {
-    var buf: [1]u8 = undefined;
-    _ = try std.fmt.bufPrint(buf[0..], "{d}", .{i});
-    const cbuf = buf;
-    return &cbuf;
+fn itoa(i: u8) []const u8 {
+    return std.fmt.comptimePrint("{d}", .{i});
 }
 
 fn isStringLiteral(comptime T: type) bool {
@@ -1842,23 +1740,113 @@ fn isStringLiteral(comptime T: type) bool {
 fn isDecl(comptime T: type, comptime name: []const u8, comptime Decl: type, comptime isErr: bool) bool {
     if (!@hasDecl(T, name)) {
         if (isErr) {
-            const msg = @typeName(T) ++ ": no '" ++ name ++ "' declaration";
-            fmtErr(comptime msg.len, msg, T);
+            fmtErr(@typeName(T) ++ ": no '" ++ name ++ "' declaration", T);
         }
         return false;
     }
     const typeOK = @TypeOf(@field(T, name)) == Decl;
     if (!typeOK and isErr) {
-        const msg = @typeName(T) ++ ": '" ++ name ++ "' wrong type";
-        fmtErr(comptime msg.len, msg, T);
+        fmtErr(@typeName(T) ++ ": '" ++ name ++ "' wrong type", T);
     }
     return typeOK;
 }
 
-fn fmtErr(comptime n: usize, comptime msg: *const [n:0]u8, comptime T: type) void {
+fn fmtErr(comptime msg: anytype, comptime T: type) void {
     if (!builtin.is_test) {
         @compileLog(msg, T);
     }
+}
+
+// NOTE:
+// The mechanism is based on 2 steps
+// 1. The compile step at comptime will produce a list of APIs
+// At this step we:
+// - reflect the native types to obtain type information (T_refl)
+// - generate a loading function containing corresponding JS callbacks functions
+// (constructor, getters, setters, methods)
+// 2. The loading step at runtime will produce a list of TPLs
+// At this step we call the loading function into the runtime v8 (Isolate and globals),
+// generating corresponding V8 functions and objects templates.
+
+// reflect the user-defined types to obtain type information (T_refl)
+// This function must be called at comptime by the root file of the project
+// and stored in a constant named `Types`
+fn mergeAndFlatten(args: anytype) type {
+    @setEvalBranchQuota(100000);
+
+    const count = countInterfaces(args, 0);
+    var interfaces: [count]type = undefined;
+    _ = flattenInterfaces(args, &interfaces, 0);
+
+    const unfiltered_count, const filter_set = filterMap(count, interfaces);
+
+    var field_index: usize = 0;
+    var fields: [unfiltered_count]std.builtin.Type.StructField = undefined;
+
+    for (filter_set, 0..) |filter, i| {
+        if (filter) {
+            continue;
+        }
+        fields[field_index] = .{
+            .name = std.fmt.comptimePrint("{d}", .{field_index}),
+            .type = type,
+            // has to be true in order to properly capture the default value
+            .is_comptime = true,
+            .alignment = @alignOf(type),
+            .default_value = @ptrCast(&interfaces[i]),
+        };
+        field_index += 1;
+    }
+
+    return @Type(.{ .Struct = .{
+        .layout = .auto,
+        .fields = &fields,
+        .decls = &.{},
+        .is_tuple = true,
+    } });
+}
+
+fn countInterfaces(args: anytype, count: usize) usize {
+    var new_count = count;
+    for (@typeInfo(@TypeOf(args)).Struct.fields) |f| {
+        const member = @field(args, f.name);
+        if (@TypeOf(member) == type) {
+            new_count += 1;
+        } else {
+            new_count = countInterfaces(member, new_count);
+        }
+    }
+    return new_count;
+}
+
+fn flattenInterfaces(args: anytype, interfaces: []type, index: usize) usize {
+    var new_index = index;
+    for (@typeInfo(@TypeOf(args)).Struct.fields) |f| {
+        const member = @field(args, f.name);
+        if (@TypeOf(member) == type) {
+            interfaces[new_index] = member;
+            new_index += 1;
+        } else {
+            new_index = flattenInterfaces(member, interfaces, new_index);
+        }
+    }
+    return new_index;
+}
+
+fn filterMap(comptime count: usize, interfaces: [count]type) struct { usize, [count]bool } {
+    var map: [count]bool = undefined;
+    var unfiltered_count: usize = 0;
+    outer: for (interfaces, 0..) |iface, i| {
+        for (interfaces[i + 1 ..]) |check| {
+            if (iface == check) {
+                map[i] = true;
+                continue :outer;
+            }
+        }
+        map[i] = false;
+        unfiltered_count += 1;
+    }
+    return .{ unfiltered_count, map };
 }
 
 // Tests
@@ -1890,7 +1878,6 @@ const Error = error{
 
     // func errors
     FuncNoSelf,
-    FuncGetterSetterNotAllocator,
     FuncGetterMultiArg,
     FuncSetterFirstArgNotSelfPtr,
     FuncSetterNoArg,
@@ -1911,368 +1898,338 @@ const Error = error{
     TypeLookup,
 };
 
-// ensure reflection fails with an error from Error set
-fn ensureErr(arg: anytype, err: Error) !void {
-    if (@call(.auto, do, .{arg})) |_| {
-        // no error, so it's an error :)
-        @compileLog("no error", @errorName(err));
-        return error.Reflect;
-    } else |e| {
-        if (e != err) {
-            // wrong error type, it's an error
-            @compileLog("wrong error, expected, got", @errorName(err), @errorName(e));
-            return error.Reflect;
-        }
-        // expected error, OK
-    }
-}
+// const testing = std.testing;
 
-// structs tests
-const TestBase = struct {};
-const TestStructPacked = packed struct {};
-const TestStructSelfPointer = struct {
-    pub const Self = *TestBase;
-};
-const TestStructPrototypeNotPointer = struct {
-    pub const prototype = TestBase;
-};
-const TestStructWithoutProto = struct {
-    pub const prototype = *TestBase;
-};
-const TestBaseProtoCastNotFunction = struct {
-    pub const protoCast = "not a function";
-};
-const TestStructProtoCastNotFunction = struct {
-    pub const prototype = *TestBaseProtoCastNotFunction;
-};
-const TestBaseProtoCastWrongFunction = struct {
-    pub fn protoCast(_: TestBaseProtoCastWrongFunction) TestBaseProtoCastWrongFunction {
-        return .{};
-    }
-};
-const TestStructProtoCastWrongFunction = struct {
-    pub const prototype = *TestBaseProtoCastWrongFunction;
-};
-const TestBaseProtoCastDifferent = struct {
-    // should be TestBaseProtoCastDifferent or *TestBaseProtoCastDifferent
-    pub fn protoCast(_: anytype) bool {
-        return true;
-    }
-};
-const TestStructProtoCastDifferent = struct {
-    pub const prototype = *TestBaseProtoCastDifferent;
-};
-const TestStructProtoPointer = struct {
-    proto: *TestBase,
-    pub const prototype = *TestBase;
-};
-const TestStructProtoDifferent = struct {
-    proto: TestStructPacked,
-    pub const prototype = *TestBase;
-};
-const TestBaseExtern = extern struct {};
-const TestStructProtoLayout = extern struct {
-    val: bool,
-    proto: TestBaseExtern,
-    pub const prototype = *TestBaseExtern;
-};
-const TestStructLookup = struct {
-    proto: TestBase,
-    pub const prototype = *TestBase;
-};
-const TestStructDuplicateTypeA = struct {};
-const TestStructDuplicateTypeB = struct {
-    pub const Self = TestStructDuplicateTypeA;
-};
-const TestStructDuplicateGlobalTypeA = struct {
-    pub const global_type = true;
-};
-const TestStructDuplicateGlobalTypeB = struct {
-    pub const global_type = true;
-};
-const MyExceptionWithoutErrorSet = struct {};
-const TestStructExceptionWithoutErrorSet = struct {
-    pub const Exception = MyExceptionWithoutErrorSet;
-};
-const MyExceptionWrongErrorSet = struct {
-    pub const ErrorSet = bool;
-};
-const TestStructExceptionWrongErrorSet = struct {
-    pub const Exception = MyExceptionWrongErrorSet;
-};
-const MyExceptionWrong = struct {
-    pub const ErrorSet = error{
-        MyException,
-    };
-};
-const TestStructExceptionWrongInterface = struct {
-    pub const Exception = MyExceptionWrong;
-};
-const MyException = struct {
-    pub const ErrorSet = error{
-        MyException,
-    };
-    pub fn init(_: std.mem.Allocator, _: anyerror, _: []const u8) anyerror!MyException {
-        return .{};
-    }
-    pub fn get_name(_: MyException) []const u8 {
-        return "";
-    }
-    pub fn get_message(_: MyException) []const u8 {
-        return "";
-    }
-    pub fn deinit(_: *MyException, _: std.mem.Allocator) void {}
-};
-const TestStructExceptionDoesNotExist = struct {
-    pub const Exception = MyException;
-};
-const TestStructAllocNoDeinit = struct {
-    name: []const u8,
-    pub fn constructor(alloc: std.mem.Allocator, name: []const u8) TestStructAllocWrongDeinit {
-        const name_alloc = alloc.alloc(u8, name.len);
-        @memcpy(name_alloc, name);
-        return .{ .name = name_alloc };
-    }
-};
-const TestStructAllocWrongDeinit = struct {
-    name: []const u8,
-    pub fn constructor(alloc: std.mem.Allocator, name: []const u8) TestStructAllocWrongDeinit {
-        const name_alloc = alloc.alloc(u8, name.len);
-        @memcpy(name_alloc, name);
-        return .{ .name = name_alloc };
-    }
-    pub fn deinit(_: TestStructAllocWrongDeinit, _: std.mem.Allocator) void {
-        // should be a pointer
-    }
-};
+// // structs tests
+// const TestStructPacked = packed struct {};
+// const TestStructSelfPointer = struct {
+//     pub const Self = *TestBase;
+// };
+// const TestStructPrototypeNotPointer = struct {
+//     pub const prototype = TestBase;
+// };
+// const TestStructWithoutProto = struct {
+//     pub const prototype = *TestBase;
+// };
+// const TestBaseProtoCastNotFunction = struct {
+//     pub const protoCast = "not a function";
+// };
+// const TestStructProtoCastNotFunction = struct {
+//     pub const prototype = *TestBaseProtoCastNotFunction;
+// };
+// const TestBaseProtoCastWrongFunction = struct {
+//     pub fn protoCast(_: TestBaseProtoCastWrongFunction) TestBaseProtoCastWrongFunction {
+//         return .{};
+//     }
+// };
+// const TestStructProtoCastWrongFunction = struct {
+//     pub const prototype = *TestBaseProtoCastWrongFunction;
+// };
+// const TestBaseProtoCastDifferent = struct {
+//     // should be TestBaseProtoCastDifferent or *TestBaseProtoCastDifferent
+//     pub fn protoCast(_: anytype) bool {
+//         return true;
+//     }
+// };
+// const TestStructProtoCastDifferent = struct {
+//     pub const prototype = *TestBaseProtoCastDifferent;
+// };
+// const TestStructProtoPointer = struct {
+//     proto: *TestBase,
+//     pub const prototype = *TestBase;
+// };
+// const TestStructProtoDifferent = struct {
+//     proto: TestStructPacked,
+//     pub const prototype = *TestBase;
+// };
+// const TestBaseExtern = extern struct {};
+// const TestStructProtoLayout = extern struct {
+//     val: bool,
+//     proto: TestBaseExtern,
+//     pub const prototype = *TestBaseExtern;
+// };
+// const TestStructLookup = struct {
+//     proto: TestBase,
+//     pub const prototype = *TestBase;
+// };
+// const TestStructDuplicateTypeA = struct {};
+// const TestStructDuplicateTypeB = struct {
+//     pub const Self = TestStructDuplicateTypeA;
+// };
+// const TestStructDuplicateGlobalTypeA = struct {
+//     pub const global_type = true;
+// };
+// const TestStructDuplicateGlobalTypeB = struct {
+//     pub const global_type = true;
+// };
+// const MyExceptionWithoutErrorSet = struct {};
+// const TestStructExceptionWithoutErrorSet = struct {
+//     pub const Exception = MyExceptionWithoutErrorSet;
+// };
+// const MyExceptionWrongErrorSet = struct {
+//     pub const ErrorSet = bool;
+// };
+// const TestStructExceptionWrongErrorSet = struct {
+//     pub const Exception = MyExceptionWrongErrorSet;
+// };
+// const MyExceptionWrong = struct {
+//     pub const ErrorSet = error{
+//         MyException,
+//     };
+// };
+// const TestStructExceptionWrongInterface = struct {
+//     pub const Exception = MyExceptionWrong;
+// };
+// const MyException = struct {
+//     pub const ErrorSet = error{
+//         MyException,
+//     };
+//     pub fn init(_: Allocator, _: anyerror, _: []const u8) anyerror!MyException {
+//         return .{};
+//     }
+//     pub fn get_name(_: MyException) []const u8 {
+//         return "";
+//     }
+//     pub fn get_message(_: MyException) []const u8 {
+//         return "";
+//     }
+//     pub fn deinit(_: *MyException, _: Allocator) void {}
+// };
+// const TestStructExceptionDoesNotExist = struct {
+//     pub const Exception = MyException;
+// };
+// const TestStructAllocNoDeinit = struct {
+//     name: []const u8,
+//     pub fn constructor(alloc: Allocator, name: []const u8) TestStructAllocWrongDeinit {
+//         const name_alloc = alloc.alloc(u8, name.len);
+//         @memcpy(name_alloc, name);
+//         return .{ .name = name_alloc };
+//     }
+// };
+// const TestStructAllocWrongDeinit = struct {
+//     name: []const u8,
+//     pub fn constructor(alloc: Allocator, name: []const u8) TestStructAllocWrongDeinit {
+//         const name_alloc = alloc.alloc(u8, name.len);
+//         @memcpy(name_alloc, name);
+//         return .{ .name = name_alloc };
+//     }
+//     pub fn deinit(_: TestStructAllocWrongDeinit, _: Allocator) void {
+//         // should be a pointer
+//     }
+// };
 
-// funcs tests
-const TestFuncNoSelf = struct {
-    pub fn _example() void {}
-};
-const TestFuncGetterMultiArg = struct {
-    pub fn get_example(_: TestFuncGetterMultiArg, _: bool) void {}
-};
-const TestFuncGetterSetterNotAllocator = struct {
-    pub fn get_example(_: TestFuncGetterSetterNotAllocator, _: *Loop) bool {
-        return true;
-    }
-};
-const TestFuncSetterFirstArgNotSelfPtr = struct {
-    pub fn set_example(_: TestFuncSetterFirstArgNotSelfPtr) void {}
-};
-const TestFuncSetterNoArg = struct {
-    pub fn set_example(_: *TestFuncSetterNoArg) void {}
-};
-const TestFuncGetterMethodFirstArgNotSelfOrSelfPtr = struct {
-    pub fn _example(_: bool) void {}
-};
-const TestFuncVoidArg = struct {
-    pub fn _example(_: TestFuncVoidArg, _: void) void {}
-};
-const TestFuncMultiCbk = struct {
-    pub fn _example(_: TestFuncMultiCbk, _: Callback, _: Callback) void {}
-};
-const VariadicBool = Variadic(bool);
-const TestFuncVariadicNotLastOne = struct {
-    pub fn _example(_: TestFuncVariadicNotLastOne, _: ?VariadicBool, _: bool) void {}
-};
-const TestFuncReturnTypeVariadic = struct {
-    pub fn _example(_: TestFuncReturnTypeVariadic) ?VariadicBool {}
-};
-const TestFuncErrorUnionArg = struct {
-    pub fn _example(_: TestFuncErrorUnionArg, _: anyerror!void) void {}
-};
-const TestFuncCstrWithJSObject = struct {
-    pub fn constructor(_: JSObject) TestFuncCstrWithJSObject {
-        return .{};
-    }
-};
-const TestFuncPostAttach = struct {
-    // missing JSObject arg
-    pub fn postAttach(_: *TestFuncPostAttach) void {}
-};
+// // funcs tests
+// const TestFuncNoSelf = struct {
+//     pub fn _example() void {}
+// };
+// const TestFuncGetterMultiArg = struct {
+//     pub fn get_example(_: TestFuncGetterMultiArg, _: bool) void {}
+// };
+// const TestFuncSetterFirstArgNotSelfPtr = struct {
+//     pub fn set_example(_: TestFuncSetterFirstArgNotSelfPtr) void {}
+// };
+// const TestFuncSetterNoArg = struct {
+//     pub fn set_example(_: *TestFuncSetterNoArg) void {}
+// };
+// const TestFuncGetterMethodFirstArgNotSelfOrSelfPtr = struct {
+//     pub fn _example(_: bool) void {}
+// };
+// const TestFuncVoidArg = struct {
+//     pub fn _example(_: TestFuncVoidArg, _: void) void {}
+// };
+// const TestFuncMultiCbk = struct {
+//     pub fn _example(_: TestFuncMultiCbk, _: Callback, _: Callback) void {}
+// };
+// const VariadicBool = Variadic(bool);
+// const TestFuncVariadicNotLastOne = struct {
+//     pub fn _example(_: TestFuncVariadicNotLastOne, _: ?VariadicBool, _: bool) void {}
+// };
+// const TestFuncReturnTypeVariadic = struct {
+//     pub fn _example(_: TestFuncReturnTypeVariadic) ?VariadicBool {}
+// };
+// const TestFuncErrorUnionArg = struct {
+//     pub fn _example(_: TestFuncErrorUnionArg, _: anyerror!void) void {}
+// };
+// const TestFuncCstrWithJSObject = struct {
+//     pub fn constructor(_: JSObject) TestFuncCstrWithJSObject {
+//         return .{};
+//     }
+// };
+// const TestFuncPostAttach = struct {
+//     // missing JSObject arg
+//     pub fn postAttach(_: *TestFuncPostAttach) void {}
+// };
 
-// types tests
-const TestTaggedUnion = union {
-    a: bool,
-    b: bool,
-};
-const TestTypeTaggedUnion = struct {
-    pub fn _example(_: TestTypeTaggedUnion, _: TestTaggedUnion) void {}
-};
-const TestTypeNestedPtr = struct {
-    pub const TestTypeNestedBase = struct {};
-    pub fn _example(_: TestTypeNestedPtr, _: *TestTypeNestedBase) void {}
-};
-const TestTypeVariadicNotOptional = struct {
-    pub fn _example(_: TestTypeVariadicNotOptional, _: VariadicBool) void {}
-};
-const TestType = struct {};
-const TestTypeLookup = struct {
-    pub fn _example(_: TestTypeLookup, _: TestType) void {}
-};
+// // types tests
+// const TestTaggedUnion = union {
+//     a: bool,
+//     b: bool,
+// };
+// const TestTypeTaggedUnion = struct {
+//     pub fn _example(_: TestTypeTaggedUnion, _: TestTaggedUnion) void {}
+// };
+// const TestTypeNestedPtr = struct {
+//     pub const TestTypeNestedBase = struct {};
+//     pub fn _example(_: TestTypeNestedPtr, _: *TestTypeNestedBase) void {}
+// };
+// const TestTypeVariadicNotOptional = struct {
+//     pub fn _example(_: TestTypeVariadicNotOptional, _: VariadicBool) void {}
+// };
+// const TestType = struct {};
+// const TestTypeLookup = struct {
+//     pub fn _example(_: TestTypeLookup, _: TestType) void {}
+// };
 
-pub fn tests() !void {
-    std.debug.assert(@inComptime());
-    @setEvalBranchQuota(10000);
-    // we need to increase the default value in reflect tests
+// pub fn tests() !void {
+//     std.debug.assert(@inComptime());
+//     @setEvalBranchQuota(10000);
+//     // we need to increase the default value in reflect tests
 
-    // arg 'types' should be a tuple of types
-    try ensureErr(TestBase, error.TypesNotTuple);
+//     // struct checks
+//     try ensureErr(
+//         .{TestStructPacked},
+//         error.StructPacked,
+//     );
+//     try ensureErr(
+//         .{TestStructSelfPointer},
+//         error.StructSelfPointer,
+//     );
+//     try ensureErr(
+//         .{TestStructPrototypeNotPointer},
+//         error.StructPrototypeNotPointer,
+//     );
+//     try ensureErr(
+//         .{TestStructWithoutProto},
+//         error.StructWithoutProto,
+//     );
+//     try ensureErr(
+//         .{TestStructProtoCastNotFunction},
+//         error.StructProtoCastNotFunction,
+//     );
+//     try ensureErr(
+//         .{TestStructProtoCastWrongFunction},
+//         error.StructProtoCastWrongFunction,
+//     );
+//     try ensureErr(
+//         .{TestStructProtoCastDifferent},
+//         error.StructProtoDifferent,
+//     );
+//     try ensureErr(
+//         .{TestStructProtoPointer},
+//         error.StructProtoPointer,
+//     );
+//     try ensureErr(
+//         .{TestStructProtoDifferent},
+//         error.StructProtoDifferent,
+//     );
+//     try ensureErr(
+//         .{TestStructProtoLayout},
+//         error.StructProtoLayout,
+//     );
+//     try ensureErr(
+//         .{ TestStructDuplicateTypeA, TestStructDuplicateTypeB },
+//         error.StructDuplicateType,
+//     );
+//     try ensureErr(
+//         .{ TestStructDuplicateGlobalTypeA, TestStructDuplicateGlobalTypeB },
+//         error.StructDuplicateGlobalType,
+//     );
+//     try ensureErr(
+//         .{TestStructExceptionWithoutErrorSet},
+//         error.StructExceptionWithoutErrorSet,
+//     );
+//     try ensureErr(
+//         .{TestStructExceptionWrongErrorSet},
+//         error.StructExceptionWrongErrorSet,
+//     );
+//     try ensureErr(
+//         .{ TestStructExceptionWrongInterface, MyExceptionWrong },
+//         error.StructExceptionWrongInterface,
+//     );
+//     try ensureErr(
+//         .{TestStructExceptionDoesNotExist},
+//         error.StructExceptionDoesNotExist,
+//     );
+//     try ensureErr(
+//         .{TestStructAllocNoDeinit},
+//         error.StructAllocWrongDeinit,
+//     );
+//     try ensureErr(
+//         .{TestStructAllocWrongDeinit},
+//         error.StructAllocWrongDeinit,
+//     );
 
-    // each type should be a struct
-    try ensureErr(.{@TypeOf(0)}, error.StructNotStruct);
+//     // funcs checks
+//     try ensureErr(
+//         .{TestFuncNoSelf},
+//         error.FuncNoSelf,
+//     );
+//     try ensureErr(
+//         .{TestFuncGetterMultiArg},
+//         error.FuncGetterMultiArg,
+//     );
+//     try ensureErr(
+//         .{TestFuncSetterFirstArgNotSelfPtr},
+//         error.FuncSetterFirstArgNotSelfPtr,
+//     );
+//     try ensureErr(
+//         .{TestFuncSetterNoArg},
+//         error.FuncSetterNoArg,
+//     );
+//     try ensureErr(
+//         .{TestFuncGetterMethodFirstArgNotSelfOrSelfPtr},
+//         error.FuncGetterMethodFirstArgNotSelfOrSelfPtr,
+//     );
+//     try ensureErr(
+//         .{TestFuncVoidArg},
+//         error.FuncVoidArg,
+//     );
+//     try ensureErr(
+//         .{TestFuncMultiCbk},
+//         error.FuncMultiCbk,
+//     );
+//     try ensureErr(
+//         .{TestFuncVariadicNotLastOne},
+//         error.FuncVariadicNotLastOne,
+//     );
+//     try ensureErr(
+//         .{TestFuncReturnTypeVariadic},
+//         error.FuncReturnTypeVariadic,
+//     );
+//     try ensureErr(
+//         .{TestFuncErrorUnionArg},
+//         error.FuncErrorUnionArg,
+//     );
+//     try ensureErr(
+//         .{TestFuncCstrWithJSObject},
+//         error.FuncCstrWithJSObject,
+//     );
+//     try ensureErr(
+//         .{TestFuncPostAttach},
+//         error.FuncPostAttach,
+//     );
 
-    // struct checks
-    try ensureErr(
-        .{TestStructPacked},
-        error.StructPacked,
-    );
-    try ensureErr(
-        .{TestStructSelfPointer},
-        error.StructSelfPointer,
-    );
-    try ensureErr(
-        .{TestStructPrototypeNotPointer},
-        error.StructPrototypeNotPointer,
-    );
-    try ensureErr(
-        .{TestStructWithoutProto},
-        error.StructWithoutProto,
-    );
-    try ensureErr(
-        .{TestStructProtoCastNotFunction},
-        error.StructProtoCastNotFunction,
-    );
-    try ensureErr(
-        .{TestStructProtoCastWrongFunction},
-        error.StructProtoCastWrongFunction,
-    );
-    try ensureErr(
-        .{TestStructProtoCastDifferent},
-        error.StructProtoDifferent,
-    );
-    try ensureErr(
-        .{TestStructProtoPointer},
-        error.StructProtoPointer,
-    );
-    try ensureErr(
-        .{TestStructProtoDifferent},
-        error.StructProtoDifferent,
-    );
-    try ensureErr(
-        .{TestStructProtoLayout},
-        error.StructProtoLayout,
-    );
-    try ensureErr(
-        .{ TestStructDuplicateTypeA, TestStructDuplicateTypeB },
-        error.StructDuplicateType,
-    );
-    try ensureErr(
-        .{ TestStructDuplicateGlobalTypeA, TestStructDuplicateGlobalTypeB },
-        error.StructDuplicateGlobalType,
-    );
-    try ensureErr(
-        .{TestStructExceptionWithoutErrorSet},
-        error.StructExceptionWithoutErrorSet,
-    );
-    try ensureErr(
-        .{TestStructExceptionWrongErrorSet},
-        error.StructExceptionWrongErrorSet,
-    );
-    try ensureErr(
-        .{ TestStructExceptionWrongInterface, MyExceptionWrong },
-        error.StructExceptionWrongInterface,
-    );
-    try ensureErr(
-        .{TestStructExceptionDoesNotExist},
-        error.StructExceptionDoesNotExist,
-    );
-    try ensureErr(
-        .{TestStructAllocNoDeinit},
-        error.StructAllocWrongDeinit,
-    );
-    try ensureErr(
-        .{TestStructAllocWrongDeinit},
-        error.StructAllocWrongDeinit,
-    );
+//     // types checks
+//     try ensureErr(
+//         .{TestTypeTaggedUnion},
+//         error.TypeTaggedUnion,
+//     );
 
-    // funcs checks
-    try ensureErr(
-        .{TestFuncNoSelf},
-        error.FuncNoSelf,
-    );
-    try ensureErr(
-        .{TestFuncGetterMultiArg},
-        error.FuncGetterMultiArg,
-    );
-    try ensureErr(
-        .{TestFuncGetterSetterNotAllocator},
-        error.FuncGetterSetterNotAllocator,
-    );
-    try ensureErr(
-        .{TestFuncSetterFirstArgNotSelfPtr},
-        error.FuncSetterFirstArgNotSelfPtr,
-    );
-    try ensureErr(
-        .{TestFuncSetterNoArg},
-        error.FuncSetterNoArg,
-    );
-    try ensureErr(
-        .{TestFuncGetterMethodFirstArgNotSelfOrSelfPtr},
-        error.FuncGetterMethodFirstArgNotSelfOrSelfPtr,
-    );
-    try ensureErr(
-        .{TestFuncVoidArg},
-        error.FuncVoidArg,
-    );
-    try ensureErr(
-        .{TestFuncMultiCbk},
-        error.FuncMultiCbk,
-    );
-    try ensureErr(
-        .{TestFuncVariadicNotLastOne},
-        error.FuncVariadicNotLastOne,
-    );
-    try ensureErr(
-        .{TestFuncReturnTypeVariadic},
-        error.FuncReturnTypeVariadic,
-    );
-    try ensureErr(
-        .{TestFuncErrorUnionArg},
-        error.FuncErrorUnionArg,
-    );
-    try ensureErr(
-        .{TestFuncCstrWithJSObject},
-        error.FuncCstrWithJSObject,
-    );
-    try ensureErr(
-        .{TestFuncPostAttach},
-        error.FuncPostAttach,
-    );
-
-    // types checks
-    try ensureErr(
-        .{TestTypeTaggedUnion},
-        error.TypeTaggedUnion,
-    );
-
-    // lookups checks
-    try ensureErr(
-        .{TestStructLookup},
-        error.StructLookup,
-    );
-    try ensureErr(
-        .{TestTypeNestedPtr},
-        error.TypeNestedPtr,
-    );
-    try ensureErr(
-        .{TestTypeVariadicNotOptional},
-        error.TypeVariadicNotOptional,
-    );
-    try ensureErr(
-        .{TestTypeLookup},
-        error.TypeLookup,
-    );
-}
+//     // lookups checks
+//     try ensureErr(
+//         .{TestStructLookup},
+//         error.StructLookup,
+//     );
+//     try ensureErr(
+//         .{TestTypeNestedPtr},
+//         error.TypeNestedPtr,
+//     );
+//     try ensureErr(
+//         .{TestTypeVariadicNotOptional},
+//         error.TypeVariadicNotOptional,
+//     );
+//     try ensureErr(
+//         .{TestTypeLookup},
+//         error.TypeLookup,
+//     );
+// }

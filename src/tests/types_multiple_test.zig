@@ -17,6 +17,8 @@ const std = @import("std");
 const public = @import("../api.zig");
 const tests = public.test_utils;
 
+const js_config = public.Config(.{ Windows, MacOS, Linux, Computer }, void);
+
 const Windows = struct {
     const manufacturer = "Microsoft";
 
@@ -73,27 +75,17 @@ const Computer = struct {
     }
 };
 
-pub const Types = .{
-    Windows,
-    MacOS,
-    Linux,
-    Computer,
-};
-
 // exec tests
-pub fn exec(
-    _: std.mem.Allocator,
-    js_env: *public.Env,
-) anyerror!void {
-
-    // start JS env
-    try js_env.start();
-    defer js_env.stop();
+test "integration: multiple" {
+    var buf: [1024 * 4]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    var runner = try tests.CaseRunner(js_config).init(fba.allocator(), {});
+    defer runner.deinit();
 
     var cases = [_]tests.Case{
         .{ .src = "let linux_computer = new Computer('linux');", .ex = "undefined" },
         .{ .src = "let os = linux_computer.os;", .ex = "undefined" },
         .{ .src = "os.manufacturer", .ex = "Linux Foundation" },
     };
-    try tests.checkCases(js_env, &cases);
+    try runner.run(&cases);
 }

@@ -19,11 +19,20 @@ const tests = public.test_utils;
 const MyIterable = public.Iterable(u8);
 const Variadic = public.Variadic;
 
+const js_config = public.Config(.{
+    MyIterable,
+    MyList,
+    MyVariadic,
+    MyErrorUnion,
+    MyException,
+    MyTypeWithException,
+}, void);
+
 const MyList = struct {
     items: []u8,
 
-    pub fn constructor(alloc: std.mem.Allocator, elem1: u8, elem2: u8, elem3: u8) MyList {
-        var items = alloc.alloc(u8, 3) catch unreachable;
+    pub fn constructor(allocator: std.mem.Allocator, elem1: u8, elem2: u8, elem3: u8) MyList {
+        var items = allocator.alloc(u8, 3) catch unreachable;
         items[0] = elem1;
         items[1] = elem2;
         items[2] = elem3;
@@ -38,8 +47,8 @@ const MyList = struct {
         return MyIterable.init(self.items);
     }
 
-    pub fn deinit(self: *MyList, alloc: std.mem.Allocator) void {
-        alloc.free(self.items);
+    pub fn deinit(self: *MyList, allocator: std.mem.Allocator) void {
+        allocator.free(self.items);
     }
 };
 
@@ -79,7 +88,7 @@ const MyVariadic = struct {
         return variadic.?.slice[0]._first();
     }
 
-    pub fn deinit(_: *MyVariadic, _: std.mem.Allocator) void {}
+    pub fn deinit(_: *MyVariadic) void {}
 };
 
 const MyErrorUnion = struct {
@@ -175,24 +184,11 @@ const MyTypeWithException = struct {
     }
 };
 
-pub const Types = .{
-    MyIterable,
-    MyList,
-    MyVariadic,
-    MyErrorUnion,
-    MyException,
-    MyTypeWithException,
-};
-
-// exec tests
-pub fn exec(
-    _: std.mem.Allocator,
-    js_env: *public.Env,
-) anyerror!void {
-
-    // start JS env
-    try js_env.start();
-    defer js_env.stop();
+test "integration: complex" {
+    var buf: [1024 * 4]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    var runner = try tests.CaseRunner(js_config).init(fba.allocator(), {});
+    defer runner.deinit();
 
     var iter = [_]tests.Case{
         .{ .src = "let myList = new MyList(1, 2, 3);", .ex = "undefined" },
@@ -206,7 +202,7 @@ pub fn exec(
         .{ .src = "arr.length;", .ex = "3" },
         .{ .src = "arr[0];", .ex = "1" },
     };
-    try tests.checkCases(js_env, &iter);
+    try runner.run(&iter);
 
     var variadic = [_]tests.Case{
         .{ .src = "let myVariadic = new MyVariadic();", .ex = "undefined" },
@@ -217,7 +213,7 @@ pub fn exec(
         .{ .src = "myVariadic.myListLen(myList)", .ex = "1" },
         .{ .src = "myVariadic.myListFirst(myList)", .ex = "1" },
     };
-    try tests.checkCases(js_env, &variadic);
+    try runner.run(&variadic);
 
     var error_union = [_]tests.Case{
         .{ .src = "var myErrorCstr = ''; try {new MyErrorUnion(true)} catch (error) {myErrorCstr = error}; myErrorCstr", .ex = "Error: MyError" },
@@ -229,7 +225,7 @@ pub fn exec(
         .{ .src = "myErrorUnion.funcWithoutError()", .ex = "undefined" },
         .{ .src = "var myErrorFunc = ''; try {myErrorUnion.funcWithError()} catch (error) {myErrorFunc = error}; myErrorFunc", .ex = "Error: MyError" },
     };
-    try tests.checkCases(js_env, &error_union);
+    try runner.run(&error_union);
 
     var exception = [_]tests.Case{
         .{ .src = "MyException.prototype.__proto__ === Error.prototype", .ex = "true" },
@@ -241,5 +237,5 @@ pub fn exec(
         .{ .src = "var mySuperError = ''; try {myTypeWithException.superSetError()} catch (error) {mySuperError = error}", .ex = "MyCustomError: Some custom message." },
         .{ .src = "var oomError = ''; try {myTypeWithException.outOfMemory()} catch (error) {oomError = error}; oomError", .ex = "Error: OutOfMemory" },
     };
-    try tests.checkCases(js_env, &exception);
+    try runner.run(&exception);
 }

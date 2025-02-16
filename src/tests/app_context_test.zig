@@ -3,11 +3,13 @@ const std = @import("std");
 const public = @import("../api.zig");
 const tests = public.test_utils;
 
+const js_config = public.Config(.{
+    Request,
+}, Config);
+
 const Config = struct {
     use_proxy: bool,
 };
-
-pub const UserContext = Config;
 
 const Request = struct {
     use_proxy: bool,
@@ -27,27 +29,18 @@ const Request = struct {
     }
 };
 
-pub const Types = .{
-    Request,
-};
-
-// exec tests
-pub fn exec(
-    _: std.mem.Allocator,
-    js_env: *public.Env,
-) anyerror!void {
-    try js_env.setUserContext(Config{
+test "integration: app_context" {
+    var buf: [1024 * 4]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    var runner = try tests.CaseRunner(js_config).init(fba.allocator(), .{
         .use_proxy = true,
     });
-
-    // start JS env
-    try js_env.start();
-    defer js_env.stop();
+    defer runner.deinit();
 
     var tc = [_]tests.Case{
         .{ .src = "const req = new Request();", .ex = "undefined" },
         .{ .src = "req.proxy", .ex = "true" },
         .{ .src = "req.configProxy()", .ex = "true" },
     };
-    try tests.checkCases(js_env, &tc);
+    try runner.run(&tc);
 }

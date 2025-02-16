@@ -14,58 +14,67 @@
 
 const std = @import("std");
 
-const Loop = @import("api.zig").Loop;
-const UserContext = @import("api.zig").UserContext;
-const NatObjects = @import("internal_api.zig").refs.Map;
+const Allocator = std.mem.Allocator;
 
-pub const NativeContext = struct {
-    alloc: std.mem.Allocator,
-    loop: *Loop,
-    userctx: ?UserContext,
+const api = @import("api.zig");
+const refl = @import("reflect.zig");
+const Loop = api.Loop;
 
-    js_objs: JSObjects,
-    nat_objs: NatObjects,
+pub fn NativeContext(comptime config: anytype) type {
+    return struct {
+        loop: *Loop,
+        allocator: Allocator,
 
-    // NOTE: DO NOT ACCESS DIRECTLY js_types
-    // - use once loadTypes at startup to set them
-    // - and then getType during execution to access them
-    js_types: ?[]usize = null,
+        // App-specific context.
+        app_context: config.AppContext,
 
-    pub const JSObjects = std.AutoHashMapUnmanaged(usize, usize);
+        // only loaded once we have an Engine.Env ready
+        // a bit of a chicken and egg thing with Context and Engine.Env
+        _js_types: [config.app_types.len]usize,
 
-    pub fn init(self: *NativeContext, alloc: std.mem.Allocator, loop: *Loop, userctx: ?UserContext) void {
-        self.* = .{
-            .alloc = alloc,
-            .loop = loop,
-            .userctx = userctx,
-            .js_objs = JSObjects{},
-            .nat_objs = NatObjects{},
-        };
-    }
+        _js_objects: std.AutoHashMapUnmanaged(usize, usize),
 
-    pub fn stop(self: *NativeContext) void {
-        self.js_objs.clearAndFree(self.alloc);
-        self.nat_objs.clearAndFree(self.alloc);
-    }
+        // Map references all objects created in both JS and Native world
+        // either from JS through a constructor template call or from Native in
+        // an addObject call
+        //  - key is the adress of the object (as an int) it will be store on the JS object as an internal field
+        //  - value is the index of API
+        _native_objects: std.AutoHashMapUnmanaged(usize, usize),
 
-    // loadTypes into the NativeContext
-    // The caller holds the memory of the js_types slice,
-    // no heap allocation is performed at the NativeContext level
-    pub fn loadTypes(self: *NativeContext, js_types: []usize) void {
-        std.debug.assert(self.js_types == null);
-        self.js_types = js_types;
-    }
+        const Self = @This();
 
-    pub fn getType(self: *const NativeContext, comptime T: type, index: usize) *T {
-        std.debug.assert(self.js_types != null);
-        const t = self.js_types.?[index];
-        return @as(*T, @ptrFromInt(t));
-    }
+        pub fn init(allocator: Allocator, loop: *Loop, app_context: config.AppContext) Self {
+            return .{
+                .loop = loop,
+                ._js_types = undefined,
+                ._js_objects = .{},
+                ._native_objects = .{},
+                .allocator = allocator,
+                .app_context = app_context,
+            };
+        }
 
-    pub fn deinit(self: *NativeContext) void {
-        self.stop();
-        self.js_objs.deinit(self.alloc);
-        self.nat_objs.deinit(self.alloc);
-        self.* = undefined;
-    }
-};
+        pub fn deinit(self: *Self) void {
+            self._js_objects.deinit(self.allocator);
+            self._native_objects.deinit(self.allocator);
+        }
+
+        pub fn stop(self: *Self) void {
+            self._js_objects.clearAndFree(self.allocator);
+            self._native_objects.clearAndFree(self.allocator);
+        }
+
+        pub fn getType(self: *const Self, comptime T: type, index: usize) *T {
+            const t = self._js_types[index];
+            return @as(*T, @ptrFromInt(t));
+        }
+
+        pub fn putNativeObject(self: *Self, ptr: usize, index: usize) !void {
+            try self._native_objects.put(self.allocator, ptr, index);
+        }
+
+        pub fn putJsObject(self: *Self, native_ref: usize, js_ref: usize) !void {
+            try self._js_objects.put(self.allocator, native_ref, js_ref);
+        }
+    };
+}

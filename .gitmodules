@@ -3,7 +3,8 @@
 	url = https://github.com/Browsercore/zig-v8-fork.git/
 [submodule "vendor/tigerbeetle-io"]
 	path = vendor/tigerbeetle-io
-	url = https://github.com/Browsercore/tigerbeetle-io.git/
+	url = https://github.com/karlseguin/tigerbeetle-io.git/
+	branch = generics
 [submodule "vendor/linenoise-mob"]
 	path = vendor/linenoise-mob
 	url = https://github.com/rain-1/linenoise-mob.git/

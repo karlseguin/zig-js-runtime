@@ -17,6 +17,8 @@ const std = @import("std");
 const public = @import("../api.zig");
 const tests = public.test_utils;
 
+const js_config = public.Config(.{Primitives}, void);
+
 // TODO: use functions instead of "fake" struct once we handle function API generation
 const Primitives = struct {
     const i64Num = @import("../types.zig").i64Num;
@@ -109,25 +111,17 @@ const Primitives = struct {
     }
 };
 
-pub const Types = .{
-    Primitives,
-};
-
-// exec tests
-pub fn exec(
-    _: std.mem.Allocator,
-    js_env: *public.Env,
-) anyerror!void {
-
-    // start JS env
-    try js_env.start();
-    defer js_env.stop();
+test "integration: primitives" {
+    var buf: [1024 * 4]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    var runner = try tests.CaseRunner(js_config).init(fba.allocator(), {});
+    defer runner.deinit();
 
     // constructor
     var case_cstr = [_]tests.Case{
         .{ .src = "let p = new Primitives();", .ex = "undefined" },
     };
-    try tests.checkCases(js_env, &case_cstr);
+    try runner.run(&case_cstr);
 
     // JS <> Native translation of primitive types
     var cases = [_]tests.Case{
@@ -196,5 +190,5 @@ pub fn exec(
         .{ .src = "p.checkOptionalReturnNull() === null;", .ex = "true" },
         .{ .src = "p.checkOptionalReturnString() === 'ok';", .ex = "true" },
     };
-    try tests.checkCases(js_env, &cases);
+    try runner.run(&cases);
 }

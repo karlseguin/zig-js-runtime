@@ -13,9 +13,20 @@
 // limitations under the License.
 
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 
 const public = @import("../api.zig");
 const tests = public.test_utils;
+
+const js_config = public.Config(.{
+    User,
+    Person,
+    PersonPtr,
+    Entity,
+    UserContainer,
+    PersonProtoCast,
+    UserProtoCast,
+}, void);
 
 // TODO: handle memory allocation in the data struct itself.
 // Each struct should have a deinit method to free internal memory and destroy object itself.
@@ -35,7 +46,7 @@ const Person = struct {
     pub const _AGE_MIN = 18;
     pub const _NATIONALITY = "French";
 
-    pub fn constructor(alloc: std.mem.Allocator, first_name: []u8, last_name: []u8, age: u32) Person {
+    pub fn constructor(alloc: Allocator, first_name: []u8, last_name: []u8, age: u32) Person {
 
         // alloc last_name slice to keep them after function returns
         // NOTE: we do not alloc first_name on purpose to check freeArgs
@@ -53,12 +64,12 @@ const Person = struct {
         return self.age;
     }
 
-    fn allocTest(alloc: std.mem.Allocator) !void {
+    fn allocTest(alloc: Allocator) !void {
         const v = try alloc.alloc(u8, 10);
         defer alloc.free(v);
     }
 
-    pub fn get_allocator(_: Person, alloc: std.mem.Allocator) !bool {
+    pub fn get_allocator(_: Person, alloc: Allocator) !bool {
         try Person.allocTest(alloc);
         return true;
     }
@@ -71,7 +82,7 @@ const Person = struct {
         return true;
     }
 
-    pub fn set_allocator(_: *Person, alloc: std.mem.Allocator, _: bool) void {
+    pub fn set_allocator(_: *Person, alloc: Allocator, _: bool) void {
         Person.allocTest(alloc) catch unreachable;
     }
 
@@ -99,7 +110,7 @@ const Person = struct {
         return "MyPerson";
     }
 
-    pub fn deinit(self: *Person, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *Person, alloc: Allocator) void {
         alloc.free(self.last_name);
     }
 };
@@ -111,7 +122,7 @@ const User = struct {
     pub const prototype = *Person;
 
     pub fn constructor(
-        alloc: std.mem.Allocator,
+        alloc: Allocator,
         first_name: []u8,
         last_name: []u8,
         age: u32,
@@ -124,7 +135,7 @@ const User = struct {
         return self.role;
     }
 
-    pub fn deinit(self: *User, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *User, alloc: Allocator) void {
         self.proto.deinit(alloc);
     }
 };
@@ -132,7 +143,7 @@ const User = struct {
 const PersonPtr = struct {
     name: []u8,
 
-    pub fn constructor(alloc: std.mem.Allocator, name: []u8) *PersonPtr {
+    pub fn constructor(alloc: Allocator, name: []u8) *PersonPtr {
         const name_alloc = alloc.alloc(u8, name.len) catch unreachable;
         @memcpy(name_alloc, name);
 
@@ -145,13 +156,13 @@ const PersonPtr = struct {
         return self.name;
     }
 
-    pub fn set_name(self: *PersonPtr, alloc: std.mem.Allocator, name: []u8) void {
+    pub fn set_name(self: *PersonPtr, alloc: Allocator, name: []u8) void {
         const name_alloc = alloc.alloc(u8, name.len) catch unreachable;
         @memcpy(name_alloc, name);
         self.name = name_alloc;
     }
 
-    pub fn deinit(self: *PersonPtr, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *PersonPtr, alloc: Allocator) void {
         alloc.free(self.name);
     }
 };
@@ -163,7 +174,7 @@ const UserForContainer = struct {
     pub const prototype = *Person;
 
     pub fn constructor(
-        alloc: std.mem.Allocator,
+        alloc: Allocator,
         first_name: []u8,
         last_name: []u8,
         age: u32,
@@ -182,7 +193,7 @@ const UserContainer = struct {
     pub const prototype = *Person;
 
     pub fn constructor(
-        alloc: std.mem.Allocator,
+        alloc: Allocator,
         first_name: []u8,
         last_name: []u8,
         age: u32,
@@ -203,7 +214,7 @@ const UserContainer = struct {
         return self.role;
     }
 
-    pub fn deinit(self: *UserForContainer, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *UserForContainer, alloc: Allocator) void {
         self.proto.deinit(alloc);
     }
 };
@@ -215,7 +226,7 @@ const PersonProtoCast = struct {
         return @ptrCast(child_ptr);
     }
 
-    pub fn constructor(alloc: std.mem.Allocator, first_name: []u8) PersonProtoCast {
+    pub fn constructor(alloc: Allocator, first_name: []u8) PersonProtoCast {
         const first_name_alloc = alloc.alloc(u8, first_name.len) catch unreachable;
         @memcpy(first_name_alloc, first_name);
         return .{ .first_name = first_name_alloc };
@@ -225,7 +236,7 @@ const PersonProtoCast = struct {
         return self.first_name;
     }
 
-    pub fn deinit(self: *PersonProtoCast, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *PersonProtoCast, alloc: Allocator) void {
         alloc.free(self.first_name);
     }
 };
@@ -235,41 +246,29 @@ const UserProtoCast = struct {
 
     pub const prototype = *PersonProtoCast;
 
-    pub fn constructor(alloc: std.mem.Allocator, first_name: []u8) UserProtoCast {
+    pub fn constructor(alloc: Allocator, first_name: []u8) UserProtoCast {
         return .{ .not_proto = PersonProtoCast.constructor(alloc, first_name) };
     }
 
-    pub fn deinit(self: *UserProtoCast, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *UserProtoCast, alloc: Allocator) void {
         self.not_proto.deinit(alloc);
     }
 };
 
-pub const Types = .{
-    User,
-    Person,
-    PersonPtr,
-    Entity,
-    UserContainer,
-    PersonProtoCast,
-    UserProtoCast,
-};
-
-// exec tests
-pub fn exec(
-    alloc: std.mem.Allocator,
-    js_env: *public.Env,
-) anyerror!void {
-
-    // start JS env
-    try js_env.start();
-    defer js_env.stop();
-
-    const ownBase = tests.engineOwnPropertiesDefault();
-    const ownBaseStr = tests.intToStr(alloc, ownBase);
-    defer alloc.free(ownBaseStr);
+test "integration: prototyupe" {
+    var buf: [1024 * 4]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    var runner = try tests.CaseRunner(js_config).init(fba.allocator(), {});
+    defer runner.deinit();
 
     // global
-    try js_env.attachObject(try js_env.getGlobal(), "self", null);
+    const env = try runner.env();
+    try env.attachObject(try env.getGlobal(), "self", null);
+
+    const allocator = fba.allocator();
+    const own_base = tests.engineOwnPropertiesDefault();
+    const own_base_str = tests.intToStr(allocator, own_base);
+    defer allocator.free(own_base_str);
 
     var global = [_]tests.Case{
         .{ .src = "self.foo = function() {} !== undefined", .ex = "true" },
@@ -281,7 +280,7 @@ pub fn exec(
         .{ .src = "let not_self = 0", .ex = "undefined" },
         .{ .src = "self.not_self === undefined", .ex = "true" },
     };
-    try tests.checkCases(js_env, &global);
+    try runner.run(&global);
 
     // 1. constructor
     var cases1 = [_]tests.Case{
@@ -292,7 +291,7 @@ pub fn exec(
         .{ .src = "new Person('Francis', 40)", .ex = "TypeError" }, // arg is missing (last_name)
         .{ .src = "new Entity()", .ex = "TypeError" }, // illegal constructor
     };
-    try tests.checkCases(js_env, &cases1);
+    try runner.run(&cases1);
 
     // 2. getter
     var cases2 = [_]tests.Case{
@@ -304,7 +303,7 @@ pub fn exec(
         // here we check that freeArgs works well
         .{ .src = "p.nonAllocFirstName !== 'Francis'", .ex = "true" },
     };
-    try tests.checkCases(js_env, &cases2);
+    try runner.run(&cases2);
 
     // 3. setter
     var cases3 = [_]tests.Case{
@@ -312,7 +311,7 @@ pub fn exec(
         .{ .src = "p.age", .ex = "41" },
         .{ .src = "p.allocator = true", .ex = "true" },
     };
-    try tests.checkCases(js_env, &cases3);
+    try runner.run(&cases3);
 
     // 4. method
     var cases4 = [_]tests.Case{
@@ -320,11 +319,11 @@ pub fn exec(
         .{ .src = "p.fullName('unused arg') === 'Bouvier';", .ex = "true" },
         .{ .src = "p.setAgeMethod(42); p.age", .ex = "42" },
     };
-    try tests.checkCases(js_env, &cases4);
+    try runner.run(&cases4);
 
     // static attr
-    const ownPersonStr = intToStr(alloc, ownBase + 2);
-    defer alloc.free(ownPersonStr);
+    const ownPersonStr = intToStr(allocator, own_base + 2);
+    defer allocator.free(ownPersonStr);
     var cases_static = [_]tests.Case{
         // basic static case
         .{ .src = "Person.AGE_MIN === 18", .ex = "true" },
@@ -336,7 +335,7 @@ pub fn exec(
         .{ .src = "p.AGE_MIN === 18", .ex = "true" },
         .{ .src = "p.NATIONALITY === 'French'", .ex = "true" },
     };
-    try tests.checkCases(js_env, &cases_static);
+    try runner.run(&cases_static);
 
     // prototype chain, constructor level
     var cases_proto_constructor = [_]tests.Case{
@@ -349,9 +348,9 @@ pub fn exec(
         .{ .src = "User.NATIONALITY === 'French'", .ex = "true" },
         // static attributes inherited are NOT own properties
         .{ .src = "let ownUser = Object.getOwnPropertyNames(User)", .ex = "undefined" },
-        .{ .src = "ownUser.length", .ex = ownBaseStr },
+        .{ .src = "ownUser.length", .ex = own_base_str },
     };
-    try tests.checkCases(js_env, &cases_proto_constructor);
+    try runner.run(&cases_proto_constructor);
 
     // prototype chain, instance level
     var cases_proto_instance = [_]tests.Case{
@@ -368,14 +367,14 @@ pub fn exec(
         .{ .src = "u.AGE_MIN === 18", .ex = "true" },
         .{ .src = "u.NATIONALITY === 'French'", .ex = "true" },
     };
-    try tests.checkCases(js_env, &cases_proto_instance);
+    try runner.run(&cases_proto_instance);
 
     // constructor returning pointer
     var casesPtr = [_]tests.Case{
         .{ .src = "let pptr = new PersonPtr('Francis');", .ex = "undefined" },
         .{ .src = "pptr.name = 'Bouvier'; pptr.name === 'Bouvier'", .ex = "true" },
     };
-    try tests.checkCases(js_env, &casesPtr);
+    try runner.run(&casesPtr);
 
     // container
     var casesContainer = [_]tests.Case{
@@ -385,7 +384,7 @@ pub fn exec(
         .{ .src = "uc.roleVal() === 2", .ex = "true" },
         .{ .src = "uc.age === 40", .ex = "true" },
     };
-    try tests.checkCases(js_env, &casesContainer);
+    try runner.run(&casesContainer);
 
     // protoCast func
     var casesProtoCast = [_]tests.Case{
@@ -394,7 +393,7 @@ pub fn exec(
         .{ .src = "let upc = new UserProtoCast('Francis');", .ex = "undefined" },
         .{ .src = "upc.name === 'Francis'", .ex = "true" },
     };
-    try tests.checkCases(js_env, &casesProtoCast);
+    try runner.run(&casesProtoCast);
 
     // free func arguments
     var casesFreeArguments = [_]tests.Case{
@@ -402,7 +401,7 @@ pub fn exec(
         .{ .src = "dt.say('42')", .ex = "undefined" },
         .{ .src = "dt.say(null)", .ex = "undefined" },
     };
-    try tests.checkCases(js_env, &casesFreeArguments);
+    try runner.run(&casesFreeArguments);
 
     var strict_const = [_]tests.Case{
         .{ .src = 
@@ -411,10 +410,10 @@ pub fn exec(
         \\cp.age = 35;
         , .ex = "35" },
     };
-    try tests.checkCases(js_env, &strict_const);
+    try runner.run(&strict_const);
 }
 
-fn intToStr(alloc: std.mem.Allocator, nb: u8) []const u8 {
+fn intToStr(alloc: Allocator, nb: u8) []const u8 {
     return std.fmt.allocPrint(
         alloc,
         "{d}",

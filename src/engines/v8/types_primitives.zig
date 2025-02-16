@@ -16,9 +16,7 @@ const std = @import("std");
 
 const v8 = @import("v8");
 
-const internal = @import("../../internal_api.zig");
-const refl = internal.refl;
-
+const refl = @import("../../reflect.zig");
 const public = @import("../../api.zig");
 const i64Num = public.i64Num;
 const u64Num = public.u64Num;
@@ -67,8 +65,8 @@ pub fn nativeToJS(
 // allocator is only used if the JS value is a string,
 // in this case caller owns the memory
 pub fn jsToNative(
-    alloc: std.mem.Allocator,
     comptime T: type,
+    alloc: std.mem.Allocator,
     js_val: v8.Value,
     isolate: v8.Isolate,
     ctx: v8.Context,
@@ -105,7 +103,7 @@ pub fn jsToNative(
 
     // unwrap Optional
     if (info == .Optional) {
-        return try jsToNative(alloc, info.Optional.child, js_val, isolate, ctx);
+        return try jsToNative(info.Optional.child, alloc, js_val, isolate, ctx);
     }
 
     // JS values
@@ -173,9 +171,9 @@ pub fn jsToNative(
 
 // Convert a JS value to a Native nested object
 pub fn jsToObject(
-    alloc: std.mem.Allocator,
     comptime nested_T: refl.StructNested,
     comptime T: type,
+    alloc: std.mem.Allocator,
     js_val: v8.Value,
     isolate: v8.Isolate,
     ctx: v8.Context,
@@ -197,7 +195,7 @@ pub fn jsToObject(
 
     // unwrap Optional
     if (comptime info == .Optional) {
-        return try jsToObject(alloc, nested_T, info.Optional.child, js_val, isolate, ctx);
+        return try jsToObject(nested_T, info.Optional.child, alloc, js_val, isolate, ctx);
     }
 
     const js_obj = js_val.castTo(v8.Object);
@@ -207,7 +205,7 @@ pub fn jsToObject(
         const key = v8.String.initUtf8(isolate, name);
         if (js_obj.has(ctx, key.toValue())) {
             const field_js_val = try js_obj.getValue(ctx, key);
-            const field_val = try jsToNative(alloc, field.T, field_js_val, isolate, ctx);
+            const field_val = try jsToNative(field.T, alloc, field_js_val, isolate, ctx);
             @field(obj, name) = field_val;
         } else {
             if (comptime field.underOpt() != null) {

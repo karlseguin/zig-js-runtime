@@ -115,7 +115,7 @@ shell:
 ## Test
 test:
 	@printf "\e[36mTesting...\e[0m\n"
-	@$(ZIG) build test -Dengine=v8 || (printf "\e[33mTest ERROR\e[0m\n"; exit 1;)
+	@$(ZIG) build test -freference-trace -Dengine=v8 || (printf "\e[33mTest ERROR\e[0m\n"; exit 1;)
 	@printf "\e[33mTest OK\e[0m\n"
 
 ## run + save results in benchmarks dir

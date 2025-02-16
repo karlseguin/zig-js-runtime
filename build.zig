@@ -120,12 +120,12 @@ pub fn build(b: *std.Build) !void {
 
     // compile
     const tests = b.addTest(.{
-        .root_source_file = b.path("src/run_tests.zig"),
         .target = target,
         .optimize = mode,
+        .root_source_file = b.path("src/api.zig"),
+        .test_runner = b.path("src/test_runner.zig"),
     });
     try common(b, &tests.root_module, options);
-    tests.test_runner = b.path("src/test_runner.zig");
     const run_tests = b.addRunArtifact(tests);
 
     // step

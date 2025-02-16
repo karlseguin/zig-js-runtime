@@ -14,14 +14,19 @@
 
 const std = @import("std");
 
-const jsruntime = @import("../api.zig");
+const public = @import("../api.zig");
 
-const u64Num = jsruntime.u64Num;
-const Callback = jsruntime.Callback;
-const CallbackSync = jsruntime.CallbackSync;
-const CallbackArg = jsruntime.CallbackArg;
+const u64Num = public.u64Num;
+const Callback = public.Callback;
+const CallbackSync = public.CallbackSync;
+const CallbackArg = public.CallbackArg;
 
-const tests = jsruntime.test_utils;
+const tests = public.test_utils;
+
+const js_config = public.Config(.{
+    OtherCbk,
+    Window,
+}, void);
 
 pub const OtherCbk = struct {
     val: u8,
@@ -52,12 +57,12 @@ pub const Window = struct {
 
     pub fn _cbkAsync(
         self: *Window,
-        loop: *jsruntime.Loop,
+        loop: *public.Loop,
         callback: Callback,
         milliseconds: u32,
     ) u32 {
         const n: u63 = @intCast(milliseconds);
-        const id = loop.timeout(n * std.time.ns_per_ms, callback);
+        const id = loop.timeout(js_config, n * std.time.ns_per_ms, callback);
 
         defer self.timeoutid += 1;
         self.timeoutids[self.timeoutid] = id;
@@ -67,13 +72,13 @@ pub const Window = struct {
 
     pub fn _cbkAsyncWithJSArg(
         self: *Window,
-        loop: *jsruntime.Loop,
+        loop: *public.Loop,
         callback: Callback,
         milliseconds: u32,
         _: CallbackArg,
     ) u32 {
         const n: u63 = @intCast(milliseconds);
-        const id = loop.timeout(n * std.time.ns_per_ms, callback);
+        const id = loop.timeout(js_config, n * std.time.ns_per_ms, callback);
 
         defer self.timeoutid += 1;
         self.timeoutids[self.timeoutid] = id;
@@ -81,46 +86,38 @@ pub const Window = struct {
         return self.timeoutid;
     }
 
-    pub fn _cancel(self: Window, loop: *jsruntime.Loop, id: u32) void {
+    pub fn _cancel(self: Window, loop: *public.Loop, id: u32) void {
         if (id >= self.timeoutid) return;
-        loop.cancel(self.timeoutids[id], null);
+        loop.cancel(js_config, self.timeoutids[id], null);
     }
 
     pub fn _cbkAsyncWithNatArg(_: Window, callback: Callback) !void {
         const other = OtherCbk{ .val = 5 };
-        callback.call(.{other}) catch {};
+        callback.call(js_config, .{other}) catch {};
         // ignore the error to let the JS msg
     }
 
     pub fn get_cbk(_: Window) void {}
 
     pub fn set_cbk(_: *Window, callback: Callback) !void {
-        callback.call(.{}) catch {};
+        callback.call(js_config, .{}) catch {};
     }
 
     pub fn deinit(_: *Window, _: std.mem.Allocator) void {}
 };
 
-pub const Types = .{
-    OtherCbk,
-    Window,
-};
-
 // exec tests
-pub fn exec(
-    _: std.mem.Allocator,
-    js_env: *jsruntime.Env,
-) anyerror!void {
-
-    // start JS env
-    try js_env.start();
-    defer js_env.stop();
+test "integration: callbacks" {
+    var buf: [1024 * 4]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    var runner = try tests.CaseRunner(js_config).init(fba.allocator(), {});
+    defer runner.deinit();
 
     // constructor
     var case_cstr = [_]tests.Case{
         .{ .src = "let window = new Window();", .ex = "undefined" },
     };
-    try tests.checkCases(js_env, &case_cstr);
+    try runner.run(&case_cstr);
 
     // cbkSyncWithoutArg
     var cases_cbk_sync_without_arg = [_]tests.Case{
@@ -144,7 +141,7 @@ pub fn exec(
         },
         .{ .src = "m;", .ex = "2" },
     };
-    try tests.checkCases(js_env, &cases_cbk_sync_without_arg);
+    try runner.run(&cases_cbk_sync_without_arg);
 
     // cbkSyncWithArg
     var cases_cbk_sync_with_arg = [_]tests.Case{
@@ -168,7 +165,7 @@ pub fn exec(
         },
         .{ .src = "y;", .ex = "3" },
     };
-    try tests.checkCases(js_env, &cases_cbk_sync_with_arg);
+    try runner.run(&cases_cbk_sync_with_arg);
 
     // cbkAsync
     var cases_cbk_async = [_]tests.Case{
@@ -184,6 +181,10 @@ pub fn exec(
             ,
             .ex = "0",
         },
+        .{
+            .src = "o",
+            .ex = "2",
+        },
         // arrow functional
         .{
             .src =
@@ -196,7 +197,7 @@ pub fn exec(
             .ex = "1",
         },
     };
-    try tests.checkCases(js_env, &cases_cbk_async);
+    try runner.run(&cases_cbk_async);
 
     // cbkAsyncWithJSArg
     var cases_cbk_async_with_js_arg = [_]tests.Case{
@@ -224,7 +225,7 @@ pub fn exec(
             .ex = "3",
         },
     };
-    try tests.checkCases(js_env, &cases_cbk_async_with_js_arg);
+    try runner.run(&cases_cbk_async_with_js_arg);
 
     // cbkAsyncWithNatArg
     var cases_cbk_async_with_nat_arg = [_]tests.Case{
@@ -250,7 +251,7 @@ pub fn exec(
             .ex = "undefined",
         },
     };
-    try tests.checkCases(js_env, &cases_cbk_async_with_nat_arg);
+    try runner.run(&cases_cbk_async_with_nat_arg);
 
     // setter cbk
     var cases_cbk_setter_arg = [_]tests.Case{
@@ -258,7 +259,7 @@ pub fn exec(
         .{ .src = "window.cbk =  () => {v++};", .ex = "() => {v++}" },
         .{ .src = "v", .ex = "1" },
     };
-    try tests.checkCases(js_env, &cases_cbk_setter_arg);
+    try runner.run(&cases_cbk_setter_arg);
 
     if (tests.isCancelAvailable()) {
         // cancel cbk
@@ -273,6 +274,6 @@ pub fn exec(
             },
             .{ .src = "vv", .ex = "0" },
         };
-        try tests.checkCases(js_env, &cases_cbk_cancel);
+        try runner.run(&cases_cbk_cancel);
     }
 }

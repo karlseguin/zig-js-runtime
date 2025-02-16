@@ -13,10 +13,51 @@
 // limitations under the License.
 
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 
 const public = @import("../api.zig");
 
-const js_response_size = 220;
+pub fn CaseRunner(comptime config: type) type {
+    return struct {
+        allocator: Allocator,
+        loop: public.Loop,
+        app_context: config.AppContext,
+        _env: ?*public.Env(config) = null,
+
+        const Self = @This();
+
+        pub fn init(allocator: Allocator, app_context: config.AppContext) !Self {
+            var loop = try public.Loop.init(allocator);
+            errdefer loop.deinit();
+
+            return .{
+                .loop = loop,
+                .allocator = allocator,
+                .app_context = app_context,
+            };
+        }
+
+        pub fn deinit(self: *Self) void {
+            if (self._env) |e| {
+                e.stop();
+                e.deinit();
+            }
+            self.loop.deinit();
+        }
+
+        pub fn env(self: *Self) !*public.Env(config) {
+            if (self._env == null) {
+                self._env = try config.createEnv(self.allocator, &self.loop, self.app_context);
+                try self._env.?.start();
+            }
+            return self._env.?;
+        }
+
+        pub fn run(self: *Self, cases: []const Case) !void {
+            return checkCasesAlloc(self.allocator, try self.env(), cases);
+        }
+    };
+}
 
 fn isTypeError(expected: []const u8, msg: []const u8) bool {
     if (!std.mem.eql(u8, expected, "TypeError")) {
@@ -51,7 +92,7 @@ pub fn intToStr(alloc: std.mem.Allocator, nb: u8) []const u8 {
 // by default for a current Type
 // result memory is owned by the caller
 pub fn engineOwnPropertiesDefault() u8 {
-    return switch (public.Env.engine()) {
+    return switch (public.Engine.engine()) {
         .v8 => 5,
     };
 }
@@ -70,40 +111,30 @@ fn caseError(src: []const u8, exp: []const u8, res: []const u8, stack: ?[]const 
     }
 }
 
-pub fn checkCases(js_env: *public.Env, cases: []Case) !void {
-    // res buf
-    var res_buf: [js_response_size]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&res_buf);
-    const fba_alloc = fba.allocator();
-
-    try checkCasesAlloc(fba_alloc, js_env, cases);
-}
-
-pub fn checkCasesAlloc(allocator: std.mem.Allocator, js_env: *public.Env, cases: []Case) !void {
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    const alloc = arena.allocator();
-    defer arena.deinit();
-
+pub fn checkCasesAlloc(allocator: Allocator, env: anytype, cases: []const Case) !void {
     var has_error = false;
 
     var try_catch: public.TryCatch = undefined;
-    try_catch.init(js_env.*);
+    try_catch.init(env);
     defer try_catch.deinit();
+
+    var case_arena = std.heap.ArenaAllocator.init(allocator);
+    const alloc = case_arena.allocator();
+    defer case_arena.deinit();
 
     // cases
     for (cases, 0..) |case, i| {
-        defer _ = arena.reset(.retain_capacity);
+        defer _ = case_arena.reset(.retain_capacity);
         test_case += 1;
 
         // prepare script execution
-        var buf: [99]u8 = undefined;
-        const name = try std.fmt.bufPrint(buf[0..], "test_{d}.js", .{test_case});
+        const name = try std.fmt.allocPrint(alloc, "test_{d}.js", .{test_case});
 
         // run script error
-        const res = js_env.execWait(case.src, name) catch |err| {
+        const res = env.execWait(case.src, name) catch |err| {
 
             // is it an intended error?
-            const except = try try_catch.exception(alloc, js_env.*);
+            const except = try try_catch.exception(alloc, env);
             if (except) |msg| {
                 defer alloc.free(msg);
                 if (isTypeError(case.ex, msg)) continue;
@@ -119,7 +150,7 @@ pub fn checkCasesAlloc(allocator: std.mem.Allocator, js_env: *public.Env, cases:
                 error.JSExecCallback => case.cbk_ex,
                 else => return err,
             };
-            if (try try_catch.stack(alloc, js_env.*)) |stack| {
+            if (try try_catch.stack(alloc, env)) |stack| {
                 defer alloc.free(stack);
                 caseError(case.src, expected, except.?, stack);
             }
@@ -127,7 +158,7 @@ pub fn checkCasesAlloc(allocator: std.mem.Allocator, js_env: *public.Env, cases:
         };
 
         // check if result is expected
-        const res_string = try res.toString(alloc, js_env.*);
+        const res_string = try res.toString(alloc, env);
         defer alloc.free(res_string);
         const equal = std.mem.eql(u8, case.ex, res_string);
         if (!equal) {
@@ -163,7 +194,7 @@ pub const Case = struct {
 // - on error, log error the JS result and JS stack if available
 pub fn runScript(
     js_env: *public.Env,
-    alloc: std.mem.Allocator,
+    alloc: Allocator,
     script: []const u8,
     name: []const u8,
 ) !void {

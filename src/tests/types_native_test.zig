@@ -13,8 +13,11 @@
 // limitations under the License.
 
 const std = @import("std");
+const Allocator = std.mem.Allocator;
 
 const public = @import("../api.zig");
+
+const JS = public.Config(.{ Brand, Car, Country, JSONGen }, void);
 
 const tests = public.test_utils;
 
@@ -23,25 +26,25 @@ const tests = public.test_utils;
 
 const Brand = struct {
     name: []const u8,
+    allocator: Allocator,
 
-    pub fn constructor(alloc: std.mem.Allocator, name: []const u8) Brand {
-        const name_alloc = alloc.alloc(u8, name.len) catch unreachable;
-        @memcpy(name_alloc, name);
-        return .{ .name = name_alloc };
+    pub fn constructor(allocator: Allocator, name: []const u8) Brand {
+        return .{
+            .allocator = allocator,
+            .name = allocator.dupe(u8, name) catch unreachable,
+        };
     }
 
     pub fn get_name(self: Brand) []const u8 {
         return self.name;
     }
 
-    pub fn set_name(self: *Brand, alloc: std.mem.Allocator, name: []u8) void {
-        const name_alloc = alloc.alloc(u8, name.len) catch unreachable;
-        @memcpy(name_alloc, name);
-        self.name = name_alloc;
+    pub fn set_name(self: *Brand, name: []u8) void {
+        self.name = self.allocator.dupe(u8, name) catch unreachable;
     }
 
-    pub fn deinit(self: *Brand, alloc: std.mem.Allocator) void {
-        alloc.free(self.name);
+    pub fn deinit(self: *Brand) void {
+        self.allocator.free(self.name);
     }
 };
 
@@ -49,11 +52,11 @@ const Car = struct {
     brand: Brand,
     brand_ptr: *Brand,
 
-    pub fn constructor(alloc: std.mem.Allocator) Car {
+    pub fn constructor(allocator: Allocator) Car {
         const brand_name: []const u8 = "Renault";
-        const brand = Brand{ .name = brand_name };
-        const brand_ptr = alloc.create(Brand) catch unreachable;
-        brand_ptr.* = Brand{ .name = brand_name };
+        const brand = Brand{ .allocator = allocator, .name = brand_name };
+        const brand_ptr = allocator.create(Brand) catch unreachable;
+        brand_ptr.* = Brand{ .allocator = allocator, .name = brand_name };
         return .{ .brand = brand, .brand_ptr = brand_ptr };
     }
 
@@ -137,8 +140,8 @@ const Car = struct {
         return self.get_brandPtr();
     }
 
-    pub fn deinit(self: *Car, alloc: std.mem.Allocator) void {
-        alloc.destroy(self.brand_ptr);
+    pub fn deinit(self: *Car, allocator: Allocator) void {
+        allocator.destroy(self.brand_ptr);
     }
 };
 
@@ -205,9 +208,9 @@ const Country = struct {
 const JSONGen = struct {
     jsobj: std.json.Parsed(std.json.Value),
 
-    pub fn constructor(alloc: std.mem.Allocator) !JSONGen {
+    pub fn constructor(allocator: Allocator) !JSONGen {
         return .{
-            .jsobj = try std.json.parseFromSlice(std.json.Value, alloc,
+            .jsobj = try std.json.parseFromSlice(std.json.Value, allocator,
                 \\{
                 \\   "str": "bar",
                 \\   "int": 123,
@@ -227,27 +230,16 @@ const JSONGen = struct {
         return self.jsobj.value;
     }
 
-    pub fn deinit(self: *JSONGen, _: std.mem.Allocator) void {
+    pub fn deinit(self: *JSONGen) void {
         self.jsobj.deinit();
     }
 };
 
-pub const Types = .{
-    Brand,
-    Car,
-    Country,
-    JSONGen,
-};
-
-// exec tests
-pub fn exec(
-    _: std.mem.Allocator,
-    js_env: *public.Env,
-) anyerror!void {
-
-    // start JS env
-    try js_env.start();
-    defer js_env.stop();
+test "integration: native types" {
+    var buf: [1024 * 16]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    var runner = try tests.CaseRunner(JS).init(fba.allocator(), {});
+    defer runner.deinit();
 
     var nested_arg = [_]tests.Case{
         .{ .src = "let stats = {'pib': '322Mds', 'population': 80}; let country = new Country(stats);", .ex = "undefined" },
@@ -259,7 +251,7 @@ pub fn exec(
         .{ .src = "country.doStatsNull();", .ex = "null" },
         .{ .src = "country.doStatsNotNull().pib;", .ex = "342Mds" },
     };
-    try tests.checkCases(js_env, &nested_arg);
+    try runner.run(&nested_arg);
 
     var separate_cases = [_]tests.Case{
         .{ .src = "let car = new Car();", .ex = "undefined" },
@@ -332,7 +324,7 @@ pub fn exec(
         .{ .src = "car.changeBrandOptPtr(null)", .ex = "undefined" },
         .{ .src = "car.brandPtr.name === 'Ford'", .ex = "true" },
     };
-    try tests.checkCases(js_env, &separate_cases);
+    try runner.run(&separate_cases);
 
     var bug_native_obj = [_]tests.Case{
         // Test for the bug #185: native func expects a object but the js value is
@@ -344,7 +336,7 @@ pub fn exec(
         // https://github.com/lightpanda-io/jsruntime-lib/issues/187
         .{ .src = "try { car.changeBrand({'foo': 'bar'}); false; } catch(e) { e instanceof TypeError; }", .ex = "true" },
     };
-    try tests.checkCases(js_env, &bug_native_obj);
+    try runner.run(&bug_native_obj);
 
     var json_native = [_]tests.Case{
         .{ .src = "let json = (new JSONGen()).object()", .ex = "undefined" },
@@ -371,5 +363,5 @@ pub fn exec(
         .{ .src = "json.array.length", .ex = "3" },
         .{ .src = "json.array[0]", .ex = "1" },
     };
-    try tests.checkCases(js_env, &json_native);
+    try runner.run(&json_native);
 }
