@@ -17,7 +17,7 @@ const std = @import("std");
 fn checkArgs(args: anytype) void {
     comptime {
         const info = @typeInfo(@TypeOf(args));
-        if (info != .Struct or !info.Struct.is_tuple) {
+        if (info != .@"struct" or !info.@"struct".is_tuple) {
             @compileError("should be a tuple");
         }
     }
@@ -55,26 +55,25 @@ pub fn GenerateTable(
         }
         var buf: [1]u8 = undefined;
         const name = try std.fmt.bufPrint(buf[0..], "{d}", .{i});
-        fields[i] = std.builtin.Type.StructField{
+        fields[i] = .{
             // StructField.name expect a null terminated string.
             // concatenate the `[]const u8` string with an empty string
             // literal (`name ++ ""`) to explicitly coerce it to `[:0]const
             // u8`.
             .name = name ++ "",
             .type = T,
-            .default_value = null,
+            .default_value_ptr = null,
             .is_comptime = false,
             .alignment = @alignOf(T),
         };
     }
-    const decls: [0]std.builtin.Type.Declaration = undefined;
-    const shape_info = std.builtin.Type.Struct{
+
+    const shape = @Type(.{ .@"struct" = .{
         .layout = .auto,
         .fields = &fields,
-        .decls = &decls,
+        .decls = &.{},
         .is_tuple = true,
-    };
-    const shape = @Type(std.builtin.Type{ .Struct = shape_info });
+    } });
 
     var table_c: TableConf = undefined;
     if (table_conf != null) {
